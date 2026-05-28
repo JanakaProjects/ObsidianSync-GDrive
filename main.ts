@@ -7,8 +7,6 @@ const GITHUB_VERSION_URL = "https://raw.githubusercontent.com/JanakaProjects/Obs
 const GITHUB_MAIN_JS_URL = "https://raw.githubusercontent.com/JanakaProjects/ObsidianSync-GDrive/main/main.js";
 const BATCH_SIZE = 5;
 
-// Snap-point presets for the sync interval slider.
-// The slider position (0–9) maps to these second values.
 const SYNC_INTERVAL_PRESETS: number[] = [1, 5, 10, 30, 60, 120, 300, 600, 900, 1800];
 
 function secondsToLabel(s: number): string {
@@ -17,7 +15,6 @@ function secondsToLabel(s: number): string {
   return m === 1 ? "1 min" : `${m} min`;
 }
 
-// Find the nearest preset index for a stored seconds value
 function secondsToPresetIndex(s: number): number {
   let best = 0;
   let bestDiff = Math.abs(SYNC_INTERVAL_PRESETS[0] - s);
@@ -28,15 +25,6 @@ function secondsToPresetIndex(s: number): number {
   return best;
 }
 
-// Encode/decode vault paths to flat Drive filenames
-function encodePath(vaultPath: string): string {
-  return vaultPath.replace(/___/g, "__TRIPLEUNDERSCORE__").replace(/\//g, "___");
-}
-function decodePath(driveName: string): string {
-  return driveName.replace(/___/g, "/").replace(/__TRIPLEUNDERSCORE__/g, "___");
-}
-
-// Conflict copy filename: "Notes/Todo.md" -> "Notes/Todo (Conflict 2026-05-28 21-30).md"
 function conflictName(filePath: string): string {
   const now = new Date();
   const stamp = now.getFullYear() + "-"
@@ -76,6 +64,8 @@ export default class GDriveSyncPlugin extends Plugin {
   accessTokenExpiry: number = 0;
   accessTokenRefreshPromise: Promise<string> | null = null;
   driveFolderId: string = "";
+  // Cache: folderPath (relative to vault root in Drive) -> Drive folder ID
+  private folderIdCache: Map<string, string> = new Map();
   syncIntervalId: number | null = null;
   statusBarItem: HTMLElement;
   isSyncing: boolean = false;
@@ -266,21 +256,99 @@ export default class GDriveSyncPlugin extends Plugin {
     }
   }
 
-  // ── Drive Folder ──────────────────────────────────────────────────────
+  // ── Drive Root Folder ─────────────────────────────────────────────────
   async ensureDriveFolder(): Promise<string> {
     if (this.driveFolderId) return this.driveFolderId;
     const token = await this.getAccessToken();
     const name = this.settings.driveFolderName;
-    const query = `name='${name}' and mimeType='application/vnd.google-apps.folder' and trashed=false`;
+    const query = `name='${name}' and mimeType='application/vnd.google-apps.folder' and trashed=false and 'root' in parents`;
     const searchData = await this.apiGet(
       `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(query)}&fields=files(id,name)`, token
     );
-    if (searchData.files?.length > 0) { this.driveFolderId = searchData.files[0].id; return this.driveFolderId; }
+    if (searchData.files?.length > 0) {
+      this.driveFolderId = searchData.files[0].id;
+      return this.driveFolderId;
+    }
     const folder = await this.apiPost("https://www.googleapis.com/drive/v3/files", token, {
       name, mimeType: "application/vnd.google-apps.folder"
     });
     this.driveFolderId = folder.id;
     return this.driveFolderId;
+  }
+
+  // ── Ensure nested subfolder path, returns leaf folder ID ─────────────
+  // vaultFolderPath: e.g. "Notes/Work" relative to vault root
+  async ensureDrivePath(vaultFolderPath: string): Promise<string> {
+    const rootId = await this.ensureDriveFolder();
+    if (!vaultFolderPath || vaultFolderPath === "/") return rootId;
+
+    const parts = vaultFolderPath.split("/").filter(p => p.length > 0);
+    let parentId = rootId;
+    let cumulativePath = "";
+
+    for (const part of parts) {
+      cumulativePath = cumulativePath ? `${cumulativePath}/${part}` : part;
+      const cached = this.folderIdCache.get(cumulativePath);
+      if (cached) { parentId = cached; continue; }
+
+      const token = await this.getAccessToken();
+      const query = `name='${part}' and mimeType='application/vnd.google-apps.folder' and trashed=false and '${parentId}' in parents`;
+      const searchData = await this.apiGet(
+        `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(query)}&fields=files(id,name)`, token
+      );
+      if (searchData.files?.length > 0) {
+        parentId = searchData.files[0].id;
+      } else {
+        const newFolder = await this.apiPost("https://www.googleapis.com/drive/v3/files", token, {
+          name: part,
+          mimeType: "application/vnd.google-apps.folder",
+          parents: [parentId],
+        });
+        parentId = newFolder.id;
+      }
+      this.folderIdCache.set(cumulativePath, parentId);
+    }
+    return parentId;
+  }
+
+  // ── Get folder ID for a vault file path ──────────────────────────────
+  async getFolderIdForFile(filePath: string): Promise<string> {
+    const lastSlash = filePath.lastIndexOf("/");
+    if (lastSlash === -1) return await this.ensureDriveFolder(); // root
+    const folderPath = filePath.substring(0, lastSlash);
+    return await this.ensureDrivePath(folderPath);
+  }
+
+  // ── Recursively list all files in Drive folder tree ───────────────────
+  async listDriveFilesRecursive(
+    folderId: string,
+    pathPrefix: string = ""
+  ): Promise<{ id: string; name: string; path: string; modifiedTime: string }[]> {
+    const token = await this.getAccessToken();
+    let results: { id: string; name: string; path: string; modifiedTime: string }[] = [];
+    let pageToken: string | null = null;
+
+    do {
+      let url = `https://www.googleapis.com/drive/v3/files`
+        + `?q=${encodeURIComponent(`'${folderId}' in parents and trashed=false`)}`
+        + `&fields=nextPageToken,files(id,name,mimeType,modifiedTime)`;
+      if (pageToken) url += `&pageToken=${encodeURIComponent(pageToken)}`;
+      const data = await this.apiGet(url, token);
+
+      for (const f of (data.files || [])) {
+        const fullPath = pathPrefix ? `${pathPrefix}/${f.name}` : f.name;
+        if (f.mimeType === "application/vnd.google-apps.folder") {
+          this.folderIdCache.set(fullPath, f.id);
+          const children = await this.listDriveFilesRecursive(f.id, fullPath);
+          results = results.concat(children);
+        } else {
+          results.push({ id: f.id, name: f.name, path: fullPath, modifiedTime: f.modifiedTime });
+        }
+      }
+      pageToken = data.nextPageToken || null;
+    } while (pageToken);
+
+    return results;
   }
 
   // ── Delta Sync: Drive Changes API ─────────────────────────────────────
@@ -300,20 +368,41 @@ export default class GDriveSyncPlugin extends Plugin {
     do {
       const url = `https://www.googleapis.com/drive/v3/changes`
         + `?pageToken=${encodeURIComponent(pageToken)}`
-        + `&fields=nextPageToken,newStartPageToken,changes(removed,fileId,file(id,name,parents,trashed,modifiedTime))`
+        + `&fields=nextPageToken,newStartPageToken,changes(removed,fileId,file(id,name,parents,trashed,modifiedTime,mimeType))`
         + `&includeRemoved=true`;
       const data = await this.apiGet(url, token);
 
       for (const change of (data.changes || [])) {
         const f = change.file;
         if (!f) continue;
-        const inFolder = f.parents && f.parents.includes(folderId);
-        if (!inFolder && !change.removed) continue;
-        const filePath = decodePath(f.name || "");
+        // Skip folders themselves — we only care about file changes
+        if (f.mimeType === "application/vnd.google-apps.folder") continue;
+
+        // Resolve the full vault path by walking parent IDs
+        // For delta changes we do a best-effort path resolution using cache
+        // If not cached, skip — full sync will catch it
+        if (change.removed || f.trashed) {
+          changes.push({ filePath: change.fileId, fileId: change.fileId, removed: true, modifiedTime: 0 });
+          continue;
+        }
+
+        // Try to find the vault path from folder cache
+        const parentId = f.parents?.[0];
+        let vaultFolder = "";
+        if (parentId === folderId) {
+          vaultFolder = "";
+        } else {
+          // Find from cache
+          for (const [path, id] of this.folderIdCache.entries()) {
+            if (id === parentId) { vaultFolder = path; break; }
+          }
+          if (!vaultFolder && parentId !== folderId) continue; // can't resolve, skip
+        }
+        const filePath = vaultFolder ? `${vaultFolder}/${f.name}` : f.name;
         changes.push({
           filePath,
           fileId: change.fileId,
-          removed: !!(change.removed || f.trashed),
+          removed: false,
           modifiedTime: f.modifiedTime ? new Date(f.modifiedTime).getTime() : 0,
         });
       }
@@ -328,24 +417,6 @@ export default class GDriveSyncPlugin extends Plugin {
 
     this.driveChangesPageToken = newPageToken;
     return changes;
-  }
-
-  // ── Full file listing (first sync / no token) ─────────────────────────
-  async listDriveFiles(): Promise<{ id: string; name: string; modifiedTime: string }[]> {
-    const token = await this.getAccessToken();
-    const folderId = await this.ensureDriveFolder();
-    let allFiles: any[] = [];
-    let pageToken: string | null = null;
-    do {
-      let url = `https://www.googleapis.com/drive/v3/files`
-        + `?q=${encodeURIComponent(`'${folderId}' in parents and trashed=false`)}`
-        + `&fields=nextPageToken,files(id,name,modifiedTime)`;
-      if (pageToken) url += `&pageToken=${encodeURIComponent(pageToken)}`;
-      const data = await this.apiGet(url, token);
-      allFiles = allFiles.concat(data.files || []);
-      pageToken = data.nextPageToken || null;
-    } while (pageToken);
-    return allFiles;
   }
 
   // ── Conflict-safe file write ──────────────────────────────────────────
@@ -391,15 +462,16 @@ export default class GDriveSyncPlugin extends Plugin {
     this.isSyncing = true;
     this.setStatus("🔄 Syncing...");
     try {
-      await this.ensureDriveFolder();
+      const rootId = await this.ensureDriveFolder();
       const token = await this.getAccessToken();
       let downloaded = 0;
 
       if (!this.driveChangesPageToken) {
-        const driveFiles = await this.listDriveFiles();
+        // Full listing — walk real folder tree
+        const driveFiles = await this.listDriveFilesRecursive(rootId);
         const driveMap: Record<string, { id: string; modifiedTime: number }> = {};
         for (const df of driveFiles) {
-          driveMap[decodePath(df.name)] = { id: df.id, modifiedTime: new Date(df.modifiedTime).getTime() };
+          driveMap[df.path] = { id: df.id, modifiedTime: new Date(df.modifiedTime).getTime() };
         }
         const driveEntries = Object.entries(driveMap);
         for (let i = 0; i < driveEntries.length; i += BATCH_SIZE) {
@@ -480,15 +552,17 @@ export default class GDriveSyncPlugin extends Plugin {
     if (!force && this.lastSynced[file.path] && this.lastSynced[file.path] >= file.stat.mtime) return false;
     try {
       const token = await this.getAccessToken();
-      const folderId = await this.ensureDriveFolder();
+      const parentFolderId = await this.getFolderIdForFile(file.path);
       const content = await this.app.vault.readBinary(file);
-      const safeName = encodePath(file.path);
-      const query = `name='${safeName}' and '${folderId}' in parents and trashed=false`;
+      const fileName = file.name; // just the filename, no path
+
+      // Search for existing file in the correct subfolder
+      const query = `name='${fileName}' and '${parentFolderId}' in parents and trashed=false and mimeType!='application/vnd.google-apps.folder'`;
       const searchData = await this.apiGet(
         `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(query)}&fields=files(id)`, token
       );
       const existingId = searchData.files?.[0]?.id;
-      const metadata = { name: safeName, ...(existingId ? {} : { parents: [folderId] }) };
+      const metadata = { name: fileName, ...(existingId ? {} : { parents: [parentFolderId] }) };
       const uploadUrl = existingId
         ? `https://www.googleapis.com/upload/drive/v3/files/${existingId}?uploadType=multipart`
         : `https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart`;
@@ -506,9 +580,9 @@ export default class GDriveSyncPlugin extends Plugin {
     if (!this.isConfigured()) return;
     try {
       const token = await this.getAccessToken();
-      const folderId = await this.ensureDriveFolder();
-      const safeName = encodePath(filePath);
-      const query = `name='${safeName}' and '${folderId}' in parents and trashed=false`;
+      const parentFolderId = await this.getFolderIdForFile(filePath);
+      const fileName = filePath.includes("/") ? filePath.substring(filePath.lastIndexOf("/") + 1) : filePath;
+      const query = `name='${fileName}' and '${parentFolderId}' in parents and trashed=false`;
       const searchData = await this.apiGet(
         `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(query)}&fields=files(id)`, token
       );
@@ -528,19 +602,19 @@ export default class GDriveSyncPlugin extends Plugin {
     this.setStatus("⬇️ Downloading from Drive...");
     try {
       const token = await this.getAccessToken();
-      const driveFiles = await this.listDriveFiles();
+      const rootId = await this.ensureDriveFolder();
+      const driveFiles = await this.listDriveFilesRecursive(rootId);
       let count = 0;
       for (let i = 0; i < driveFiles.length; i += BATCH_SIZE) {
         const batch = driveFiles.slice(i, i + BATCH_SIZE);
         await Promise.all(batch.map(async (df) => {
-          const realPath = decodePath(df.name);
           try {
             const buffer = await this.apiDownload(
               `https://www.googleapis.com/drive/v3/files/${df.id}?alt=media`, token
             );
-            await this.writeFileConflictSafe(realPath, buffer, new Date(df.modifiedTime).getTime());
+            await this.writeFileConflictSafe(df.path, buffer, new Date(df.modifiedTime).getTime());
             count++;
-          } catch (e) { console.error("Download error:", realPath, this.errMsg(e)); }
+          } catch (e) { console.error("Download error:", df.path, this.errMsg(e)); }
         }));
         this.setStatus(`⬇️ ${count}/${driveFiles.length}...`);
       }
@@ -622,7 +696,6 @@ class GDriveSyncSettingTab extends PluginSettingTab {
       .addText(t => t.setValue(this.plugin.settings.driveFolderName)
         .onChange(async v => { this.plugin.settings.driveFolderName = v.trim() || "ObsidianVaultSync"; this.plugin.driveFolderId = ""; await this.plugin.saveSettings(); }));
 
-    // ── Snap-point interval slider ──
     const intervalSetting = new Setting(containerEl)
       .setName("Auto-sync interval")
       .setDesc(`Every ${secondsToLabel(this.plugin.settings.syncIntervalSeconds)}`);
