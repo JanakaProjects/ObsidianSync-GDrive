@@ -3,8 +3,8 @@ import {
   Notice, TFile, requestUrl
 } from "obsidian";
 
-const GITHUB_VERSION_URL = "https://raw.githubusercontent.com/JanakaProjects/obsidian-gdrive-sync/main/manifest.json";
-const GITHUB_MAIN_JS_URL = "https://raw.githubusercontent.com/JanakaProjects/obsidian-gdrive-sync/main/main.js";
+const GITHUB_VERSION_URL = "https://raw.githubusercontent.com/JanakaProjects/ObsidianSync-GDrive/main/manifest.json";
+const GITHUB_MAIN_JS_URL = "https://raw.githubusercontent.com/JanakaProjects/ObsidianSync-GDrive/main/main.js";
 const BATCH_SIZE = 5;
 
 // Snap-point presets for the sync interval slider.
@@ -330,7 +330,7 @@ export default class GDriveSyncPlugin extends Plugin {
     return changes;
   }
 
-  // ── Full file listing (first sync / no token) ───────────────────────────
+  // ── Full file listing (first sync / no token) ─────────────────────────
   async listDriveFiles(): Promise<{ id: string; name: string; modifiedTime: string }[]> {
     const token = await this.getAccessToken();
     const folderId = await this.ensureDriveFolder();
@@ -623,8 +623,6 @@ class GDriveSyncSettingTab extends PluginSettingTab {
         .onChange(async v => { this.plugin.settings.driveFolderName = v.trim() || "ObsidianVaultSync"; this.plugin.driveFolderId = ""; await this.plugin.saveSettings(); }));
 
     // ── Snap-point interval slider ──
-    // Slider position 0–9 maps to SYNC_INTERVAL_PRESETS.
-    // The setting desc shows the human-readable label and updates live as you drag.
     const intervalSetting = new Setting(containerEl)
       .setName("Auto-sync interval")
       .setDesc(`Every ${secondsToLabel(this.plugin.settings.syncIntervalSeconds)}`);
@@ -637,11 +635,9 @@ class GDriveSyncSettingTab extends PluginSettingTab {
         .onChange(async (idx: number) => {
           const seconds = SYNC_INTERVAL_PRESETS[idx];
           this.plugin.settings.syncIntervalSeconds = seconds;
-          // Update the description label live
           intervalSetting.setDesc(`Every ${secondsToLabel(seconds)}`);
           await this.plugin.saveSettings();
         });
-      // Show tick marks by listing all labels beneath the slider
       const tickContainer = containerEl.createEl("div", { cls: "gdrive-slider-ticks" });
       tickContainer.style.cssText = "display:flex;justify-content:space-between;font-size:10px;color:var(--text-muted);margin-top:-10px;margin-bottom:8px;padding:0 2px;";
       SYNC_INTERVAL_PRESETS.forEach(s => {
