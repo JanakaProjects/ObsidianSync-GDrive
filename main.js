@@ -26,6 +26,25 @@ var import_obsidian = require("obsidian");
 var GITHUB_VERSION_URL = "https://raw.githubusercontent.com/JanakaProjects/obsidian-gdrive-sync/main/manifest.json";
 var GITHUB_MAIN_JS_URL = "https://raw.githubusercontent.com/JanakaProjects/obsidian-gdrive-sync/main/main.js";
 var BATCH_SIZE = 5;
+var SYNC_INTERVAL_PRESETS = [1, 5, 10, 30, 60, 120, 300, 600, 900, 1800];
+function secondsToLabel(s) {
+  if (s < 60)
+    return `${s}s`;
+  const m = s / 60;
+  return m === 1 ? "1 min" : `${m} min`;
+}
+function secondsToPresetIndex(s) {
+  let best = 0;
+  let bestDiff = Math.abs(SYNC_INTERVAL_PRESETS[0] - s);
+  for (let i = 1; i < SYNC_INTERVAL_PRESETS.length; i++) {
+    const diff = Math.abs(SYNC_INTERVAL_PRESETS[i] - s);
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      best = i;
+    }
+  }
+  return best;
+}
 function encodePath(vaultPath) {
   return vaultPath.replace(/___/g, "__TRIPLEUNDERSCORE__").replace(/\//g, "___");
 }
@@ -60,7 +79,6 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
     this.syncIntervalId = null;
     this.isSyncing = false;
     this.lastSynced = {};
-    // Delta sync: Drive Changes API page token
     this.driveChangesPageToken = "";
     this.downloading = /* @__PURE__ */ new Set();
   }
@@ -282,14 +300,11 @@ Content-Type: application/octet-stream\r
     return this.driveFolderId;
   }
   // ── Delta Sync: Drive Changes API ─────────────────────────────────────
-  // Gets a fresh start page token from Drive (called once on first ever sync)
   async fetchStartPageToken() {
     const token = await this.getAccessToken();
     const data = await this.apiGet("https://www.googleapis.com/drive/v3/changes/startPageToken", token);
     return data.startPageToken;
   }
-  // Returns list of changed files in our sync folder since driveChangesPageToken,
-  // and updates driveChangesPageToken to the new token for next time.
   async fetchDeltaChanges() {
     const token = await this.getAccessToken();
     const folderId = await this.ensureDriveFolder();
@@ -324,7 +339,7 @@ Content-Type: application/octet-stream\r
     this.driveChangesPageToken = newPageToken;
     return changes;
   }
-  // ── Full file listing (used only on first sync / token missing) ───────
+  // ── Full file listing (first sync / no token) ───────────────────────────
   async listDriveFiles() {
     const token = await this.getAccessToken();
     const folderId = await this.ensureDriveFolder();
@@ -341,7 +356,6 @@ Content-Type: application/octet-stream\r
     return allFiles;
   }
   // ── Conflict-safe file write ──────────────────────────────────────────
-  // If local file was edited since our last sync, save both versions.
   async writeFileConflictSafe(filePath, buffer, driveModifiedTime) {
     var _a;
     const localFile = this.app.vault.getAbstractFileByPath(filePath);
@@ -603,7 +617,7 @@ Drive version saved as "${conflictPath}"`);
         console.log("GDrive Sync: sync in progress, skipping tick");
     }, ms);
     this.setStatus("\u{1F504} Auto-sync active");
-    new import_obsidian.Notice("\u2705 GDrive Auto-Sync started!");
+    new import_obsidian.Notice(`\u2705 GDrive Auto-Sync started! (every ${secondsToLabel(this.settings.syncIntervalSeconds)})`);
   }
   stopAutoSync() {
     if (this.syncIntervalId !== null) {
@@ -648,10 +662,21 @@ var GDriveSyncSettingTab = class extends import_obsidian.PluginSettingTab {
       this.plugin.driveFolderId = "";
       await this.plugin.saveSettings();
     }));
-    new import_obsidian.Setting(containerEl).setName("Auto-sync interval (seconds)").addSlider((s) => s.setLimits(1, 300, 1).setValue(this.plugin.settings.syncIntervalSeconds).setDynamicTooltip().onChange(async (v) => {
-      this.plugin.settings.syncIntervalSeconds = v;
-      await this.plugin.saveSettings();
-    }));
+    const intervalSetting = new import_obsidian.Setting(containerEl).setName("Auto-sync interval").setDesc(`Every ${secondsToLabel(this.plugin.settings.syncIntervalSeconds)}`);
+    intervalSetting.addSlider((slider) => {
+      const currentIndex = secondsToPresetIndex(this.plugin.settings.syncIntervalSeconds);
+      slider.setLimits(0, SYNC_INTERVAL_PRESETS.length - 1, 1).setValue(currentIndex).onChange(async (idx) => {
+        const seconds = SYNC_INTERVAL_PRESETS[idx];
+        this.plugin.settings.syncIntervalSeconds = seconds;
+        intervalSetting.setDesc(`Every ${secondsToLabel(seconds)}`);
+        await this.plugin.saveSettings();
+      });
+      const tickContainer = containerEl.createEl("div", { cls: "gdrive-slider-ticks" });
+      tickContainer.style.cssText = "display:flex;justify-content:space-between;font-size:10px;color:var(--text-muted);margin-top:-10px;margin-bottom:8px;padding:0 2px;";
+      SYNC_INTERVAL_PRESETS.forEach((s) => {
+        tickContainer.createEl("span", { text: secondsToLabel(s) });
+      });
+    });
     new import_obsidian.Setting(containerEl).setName("Auto-sync on Obsidian open").addToggle((t) => t.setValue(this.plugin.settings.autoSyncOnStart).onChange(async (v) => {
       this.plugin.settings.autoSyncOnStart = v;
       await this.plugin.saveSettings();
