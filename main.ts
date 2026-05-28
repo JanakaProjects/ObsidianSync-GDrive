@@ -7,6 +7,27 @@ const GITHUB_VERSION_URL = "https://raw.githubusercontent.com/JanakaProjects/obs
 const GITHUB_MAIN_JS_URL = "https://raw.githubusercontent.com/JanakaProjects/obsidian-gdrive-sync/main/main.js";
 const BATCH_SIZE = 5;
 
+// Snap-point presets for the sync interval slider.
+// The slider position (0–9) maps to these second values.
+const SYNC_INTERVAL_PRESETS: number[] = [1, 5, 10, 30, 60, 120, 300, 600, 900, 1800];
+
+function secondsToLabel(s: number): string {
+  if (s < 60) return `${s}s`;
+  const m = s / 60;
+  return m === 1 ? "1 min" : `${m} min`;
+}
+
+// Find the nearest preset index for a stored seconds value
+function secondsToPresetIndex(s: number): number {
+  let best = 0;
+  let bestDiff = Math.abs(SYNC_INTERVAL_PRESETS[0] - s);
+  for (let i = 1; i < SYNC_INTERVAL_PRESETS.length; i++) {
+    const diff = Math.abs(SYNC_INTERVAL_PRESETS[i] - s);
+    if (diff < bestDiff) { bestDiff = diff; best = i; }
+  }
+  return best;
+}
+
 // Encode/decode vault paths to flat Drive filenames
 function encodePath(vaultPath: string): string {
   return vaultPath.replace(/___/g, "__TRIPLEUNDERSCORE__").replace(/\//g, "___");
@@ -59,7 +80,6 @@ export default class GDriveSyncPlugin extends Plugin {
   statusBarItem: HTMLElement;
   isSyncing: boolean = false;
   lastSynced: Record<string, number> = {};
-  // Delta sync: Drive Changes API page token
   driveChangesPageToken: string = "";
   private downloading: Set<string> = new Set();
 
@@ -264,15 +284,12 @@ export default class GDriveSyncPlugin extends Plugin {
   }
 
   // ── Delta Sync: Drive Changes API ─────────────────────────────────────
-  // Gets a fresh start page token from Drive (called once on first ever sync)
   async fetchStartPageToken(): Promise<string> {
     const token = await this.getAccessToken();
     const data = await this.apiGet("https://www.googleapis.com/drive/v3/changes/startPageToken", token);
     return data.startPageToken;
   }
 
-  // Returns list of changed files in our sync folder since driveChangesPageToken,
-  // and updates driveChangesPageToken to the new token for next time.
   async fetchDeltaChanges(): Promise<{ filePath: string; fileId: string; removed: boolean; modifiedTime: number }[]> {
     const token = await this.getAccessToken();
     const folderId = await this.ensureDriveFolder();
@@ -288,7 +305,6 @@ export default class GDriveSyncPlugin extends Plugin {
       const data = await this.apiGet(url, token);
 
       for (const change of (data.changes || [])) {
-        // Only care about files inside our sync folder
         const f = change.file;
         if (!f) continue;
         const inFolder = f.parents && f.parents.includes(folderId);
@@ -314,7 +330,7 @@ export default class GDriveSyncPlugin extends Plugin {
     return changes;
   }
 
-  // ── Full file listing (used only on first sync / token missing) ───────
+  // ── Full file listing (first sync / no token) ───────────────────────────
   async listDriveFiles(): Promise<{ id: string; name: string; modifiedTime: string }[]> {
     const token = await this.getAccessToken();
     const folderId = await this.ensureDriveFolder();
@@ -333,7 +349,6 @@ export default class GDriveSyncPlugin extends Plugin {
   }
 
   // ── Conflict-safe file write ──────────────────────────────────────────
-  // If local file was edited since our last sync, save both versions.
   async writeFileConflictSafe(filePath: string, buffer: ArrayBuffer, driveModifiedTime: number): Promise<void> {
     const localFile = this.app.vault.getAbstractFileByPath(filePath);
     const lastSync = this.lastSynced[filePath] ?? 0;
@@ -343,33 +358,26 @@ export default class GDriveSyncPlugin extends Plugin {
 
     if (localFile instanceof TFile) {
       const localMtime = localFile.stat.mtime;
-      // Conflict: local was changed after last sync AND Drive also has a newer version
       if (lastSync > 0 && localMtime > lastSync && driveModifiedTime > lastSync) {
-        // Save Drive version as conflict copy first
         const conflictPath = conflictName(filePath);
         const conflictDir = conflictPath.includes("/") ? conflictPath.substring(0, conflictPath.lastIndexOf("/")) : null;
         if (conflictDir) { try { await this.app.vault.createFolder(conflictDir); } catch {} }
-        // Write Drive content into conflict file
         this.downloading.add(conflictPath);
         try {
           await this.app.vault.createBinary(conflictPath, buffer);
         } catch {
-          // conflict file might already exist in an edge case, overwrite
           const existing = this.app.vault.getAbstractFileByPath(conflictPath);
           if (existing instanceof TFile) await this.app.vault.modifyBinary(existing, buffer);
         } finally {
           this.downloading.delete(conflictPath);
         }
         new Notice(`⚠️ Conflict detected: "${filePath}"\nDrive version saved as "${conflictPath}"`);
-        // Keep local version in place — do NOT overwrite it
         return;
       }
-      // No conflict — Drive is simply newer, overwrite local
       this.downloading.add(filePath);
       try { await this.app.vault.modifyBinary(localFile, buffer); }
       finally { this.downloading.delete(filePath); }
     } else {
-      // File doesn't exist locally yet — just create it
       this.downloading.add(filePath);
       try { await this.app.vault.createBinary(filePath, buffer); }
       finally { this.downloading.delete(filePath); }
@@ -388,13 +396,11 @@ export default class GDriveSyncPlugin extends Plugin {
       let downloaded = 0;
 
       if (!this.driveChangesPageToken) {
-        // ── FIRST SYNC: no token yet — do full listing, then grab start token ──
         const driveFiles = await this.listDriveFiles();
         const driveMap: Record<string, { id: string; modifiedTime: number }> = {};
         for (const df of driveFiles) {
           driveMap[decodePath(df.name)] = { id: df.id, modifiedTime: new Date(df.modifiedTime).getTime() };
         }
-
         const driveEntries = Object.entries(driveMap);
         for (let i = 0; i < driveEntries.length; i += BATCH_SIZE) {
           const batch = driveEntries.slice(i, i + BATCH_SIZE);
@@ -414,17 +420,11 @@ export default class GDriveSyncPlugin extends Plugin {
           }));
           this.setStatus(`⬇️ ${downloaded}/${driveEntries.length}...`);
         }
-
-        // Grab start page token AFTER full sync so future syncs are delta-only
         this.driveChangesPageToken = await this.fetchStartPageToken();
-
       } else {
-        // ── SUBSEQUENT SYNCS: delta only — ask Drive what changed ──
         const changes = await this.fetchDeltaChanges();
         const relevant = changes.filter(c => !c.removed);
         const removed = changes.filter(c => c.removed);
-
-        // Handle deletions from Drive → delete locally
         for (const c of removed) {
           const localFile = this.app.vault.getAbstractFileByPath(c.filePath);
           if (localFile instanceof TFile) {
@@ -432,8 +432,6 @@ export default class GDriveSyncPlugin extends Plugin {
             catch (e) { console.error("Local delete error:", c.filePath, this.errMsg(e)); }
           }
         }
-
-        // Handle new/modified files from Drive → download with conflict detection
         for (let i = 0; i < relevant.length; i += BATCH_SIZE) {
           const batch = relevant.slice(i, i + BATCH_SIZE);
           await Promise.all(batch.map(async (c) => {
@@ -450,13 +448,11 @@ export default class GDriveSyncPlugin extends Plugin {
         }
       }
 
-      // Upload local changes to Drive (unchanged — always checks mtime)
       const localFiles = this.app.vault.getFiles();
       const toUpload = localFiles.filter(f => {
         const lastSync = this.lastSynced[f.path] ?? 0;
         return f.stat.mtime > lastSync;
       });
-
       let uploaded = 0;
       for (let i = 0; i < toUpload.length; i += BATCH_SIZE) {
         const batch = toUpload.slice(i, i + BATCH_SIZE);
@@ -548,7 +544,6 @@ export default class GDriveSyncPlugin extends Plugin {
         }));
         this.setStatus(`⬇️ ${count}/${driveFiles.length}...`);
       }
-      // Reset page token after full re-download so delta is fresh
       this.driveChangesPageToken = await this.fetchStartPageToken();
       await this.saveLastSynced();
       this.setStatus(`✅ Downloaded ${count} files`);
@@ -573,7 +568,7 @@ export default class GDriveSyncPlugin extends Plugin {
       else console.log("GDrive Sync: sync in progress, skipping tick");
     }, ms);
     this.setStatus("🔄 Auto-sync active");
-    new Notice("✅ GDrive Auto-Sync started!");
+    new Notice(`✅ GDrive Auto-Sync started! (every ${secondsToLabel(this.settings.syncIntervalSeconds)})`);
   }
 
   stopAutoSync() {
@@ -603,17 +598,73 @@ class GDriveSyncSettingTab extends PluginSettingTab {
     containerEl.empty();
     containerEl.createEl("h2", { text: "Google Drive Vault Sync" });
     containerEl.createEl("p", { text: "Enter your Google OAuth credentials. See README for setup instructions.", cls: "setting-item-description" });
-    new Setting(containerEl).setName("Client ID").setDesc("Google Cloud Console → Credentials → OAuth 2.0 Client ID").addText(t => t.setPlaceholder("xxxx.apps.googleusercontent.com").setValue(this.plugin.settings.clientId).onChange(async v => { this.plugin.settings.clientId = v.trim(); await this.plugin.saveSettings(); }));
-    new Setting(containerEl).setName("Client Secret").setDesc("Google Cloud Console → Credentials").addText(t => t.setPlaceholder("GOCSPX-...").setValue(this.plugin.settings.clientSecret).onChange(async v => { this.plugin.settings.clientSecret = v.trim(); await this.plugin.saveSettings(); }));
-    new Setting(containerEl).setName("Refresh Token").setDesc("From OAuth Playground.").addText(t => t.setPlaceholder("1//0g...").setValue(this.plugin.settings.refreshToken).onChange(async v => { this.plugin.settings.refreshToken = v.trim(); await this.plugin.saveSettings(); }));
-    new Setting(containerEl).setName("Drive Folder Name").addText(t => t.setValue(this.plugin.settings.driveFolderName).onChange(async v => { this.plugin.settings.driveFolderName = v.trim() || "ObsidianVaultSync"; this.plugin.driveFolderId = ""; await this.plugin.saveSettings(); }));
-    new Setting(containerEl).setName("Auto-sync interval (seconds)").addSlider(s => s.setLimits(1, 300, 1).setValue(this.plugin.settings.syncIntervalSeconds).setDynamicTooltip().onChange(async v => { this.plugin.settings.syncIntervalSeconds = v; await this.plugin.saveSettings(); }));
-    new Setting(containerEl).setName("Auto-sync on Obsidian open").addToggle(t => t.setValue(this.plugin.settings.autoSyncOnStart).onChange(async v => { this.plugin.settings.autoSyncOnStart = v; await this.plugin.saveSettings(); }));
+
+    new Setting(containerEl)
+      .setName("Client ID")
+      .setDesc("Google Cloud Console → Credentials → OAuth 2.0 Client ID")
+      .addText(t => t.setPlaceholder("xxxx.apps.googleusercontent.com").setValue(this.plugin.settings.clientId)
+        .onChange(async v => { this.plugin.settings.clientId = v.trim(); await this.plugin.saveSettings(); }));
+
+    new Setting(containerEl)
+      .setName("Client Secret")
+      .setDesc("Google Cloud Console → Credentials")
+      .addText(t => t.setPlaceholder("GOCSPX-...").setValue(this.plugin.settings.clientSecret)
+        .onChange(async v => { this.plugin.settings.clientSecret = v.trim(); await this.plugin.saveSettings(); }));
+
+    new Setting(containerEl)
+      .setName("Refresh Token")
+      .setDesc("From OAuth Playground.")
+      .addText(t => t.setPlaceholder("1//0g...").setValue(this.plugin.settings.refreshToken)
+        .onChange(async v => { this.plugin.settings.refreshToken = v.trim(); await this.plugin.saveSettings(); }));
+
+    new Setting(containerEl)
+      .setName("Drive Folder Name")
+      .addText(t => t.setValue(this.plugin.settings.driveFolderName)
+        .onChange(async v => { this.plugin.settings.driveFolderName = v.trim() || "ObsidianVaultSync"; this.plugin.driveFolderId = ""; await this.plugin.saveSettings(); }));
+
+    // ── Snap-point interval slider ──
+    // Slider position 0–9 maps to SYNC_INTERVAL_PRESETS.
+    // The setting desc shows the human-readable label and updates live as you drag.
+    const intervalSetting = new Setting(containerEl)
+      .setName("Auto-sync interval")
+      .setDesc(`Every ${secondsToLabel(this.plugin.settings.syncIntervalSeconds)}`);
+
+    intervalSetting.addSlider(slider => {
+      const currentIndex = secondsToPresetIndex(this.plugin.settings.syncIntervalSeconds);
+      slider
+        .setLimits(0, SYNC_INTERVAL_PRESETS.length - 1, 1)
+        .setValue(currentIndex)
+        .onChange(async (idx: number) => {
+          const seconds = SYNC_INTERVAL_PRESETS[idx];
+          this.plugin.settings.syncIntervalSeconds = seconds;
+          // Update the description label live
+          intervalSetting.setDesc(`Every ${secondsToLabel(seconds)}`);
+          await this.plugin.saveSettings();
+        });
+      // Show tick marks by listing all labels beneath the slider
+      const tickContainer = containerEl.createEl("div", { cls: "gdrive-slider-ticks" });
+      tickContainer.style.cssText = "display:flex;justify-content:space-between;font-size:10px;color:var(--text-muted);margin-top:-10px;margin-bottom:8px;padding:0 2px;";
+      SYNC_INTERVAL_PRESETS.forEach(s => {
+        tickContainer.createEl("span", { text: secondsToLabel(s) });
+      });
+    });
+
+    new Setting(containerEl)
+      .setName("Auto-sync on Obsidian open")
+      .addToggle(t => t.setValue(this.plugin.settings.autoSyncOnStart)
+        .onChange(async v => { this.plugin.settings.autoSyncOnStart = v; await this.plugin.saveSettings(); }));
+
     containerEl.createEl("h3", { text: "Actions" });
-    new Setting(containerEl).setName("Start auto-sync").addButton(b => b.setButtonText("▶ Start").setCta().onClick(() => this.plugin.startAutoSync()));
-    new Setting(containerEl).setName("Stop auto-sync").addButton(b => b.setButtonText("⏸ Stop").onClick(() => this.plugin.stopAutoSync()));
-    new Setting(containerEl).setName("Sync now").setDesc("Upload local changes and download Drive changes.").addButton(b => b.setButtonText("🔄 Two-Way Sync").onClick(() => this.plugin.fullTwoWaySync()));
-    new Setting(containerEl).setName("Download from Drive").setDesc("Force re-download all files from Drive.").addButton(b => b.setButtonText("⬇ Download All").onClick(() => this.plugin.downloadAll()));
-    new Setting(containerEl).setName("Check for update").setDesc("Manually check GitHub for a newer version.").addButton(b => b.setButtonText("🔄 Check Update").onClick(() => this.plugin.checkForUpdate()));
+
+    new Setting(containerEl).setName("Start auto-sync")
+      .addButton(b => b.setButtonText("▶ Start").setCta().onClick(() => this.plugin.startAutoSync()));
+    new Setting(containerEl).setName("Stop auto-sync")
+      .addButton(b => b.setButtonText("⏸ Stop").onClick(() => this.plugin.stopAutoSync()));
+    new Setting(containerEl).setName("Sync now").setDesc("Upload local changes and download Drive changes.")
+      .addButton(b => b.setButtonText("🔄 Two-Way Sync").onClick(() => this.plugin.fullTwoWaySync()));
+    new Setting(containerEl).setName("Download from Drive").setDesc("Force re-download all files from Drive.")
+      .addButton(b => b.setButtonText("⬇ Download All").onClick(() => this.plugin.downloadAll()));
+    new Setting(containerEl).setName("Check for update").setDesc("Manually check GitHub for a newer version.")
+      .addButton(b => b.setButtonText("🔄 Check Update").onClick(() => this.plugin.checkForUpdate()));
   }
 }
