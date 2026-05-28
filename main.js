@@ -32,6 +32,16 @@ function encodePath(vaultPath) {
 function decodePath(driveName) {
   return driveName.replace(/___/g, "/").replace(/__TRIPLEUNDERSCORE__/g, "___");
 }
+function conflictName(filePath) {
+  const now = new Date();
+  const stamp = now.getFullYear() + "-" + String(now.getMonth() + 1).padStart(2, "0") + "-" + String(now.getDate()).padStart(2, "0") + " " + String(now.getHours()).padStart(2, "0") + "-" + String(now.getMinutes()).padStart(2, "0");
+  const dot = filePath.lastIndexOf(".");
+  const slash = filePath.lastIndexOf("/");
+  if (dot > slash) {
+    return filePath.slice(0, dot) + ` (Conflict ${stamp})` + filePath.slice(dot);
+  }
+  return filePath + ` (Conflict ${stamp})`;
+}
 var DEFAULT_SETTINGS = {
   clientId: "",
   clientSecret: "",
@@ -45,20 +55,21 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
     super(...arguments);
     this.accessToken = "";
     this.accessTokenExpiry = 0;
-    // fix #12: serialise concurrent token refreshes
     this.accessTokenRefreshPromise = null;
     this.driveFolderId = "";
     this.syncIntervalId = null;
     this.isSyncing = false;
     this.lastSynced = {};
-    // fix #6: paths currently being written from Drive so watcher ignores them
+    // Delta sync: Drive Changes API page token
+    this.driveChangesPageToken = "";
     this.downloading = /* @__PURE__ */ new Set();
   }
   async onload() {
-    var _a, _b;
+    var _a, _b, _c;
     const saved = (_a = await this.loadData()) != null ? _a : {};
     this.settings = Object.assign({}, DEFAULT_SETTINGS, saved);
     this.lastSynced = (_b = saved.lastSynced) != null ? _b : {};
+    this.driveChangesPageToken = (_c = saved.driveChangesPageToken) != null ? _c : "";
     this.statusBarItem = this.addStatusBarItem();
     this.setStatus("\u23F8 GDrive Sync idle");
     this.addCommand({ id: "sync-now", name: "Sync vault now", callback: () => this.fullTwoWaySync() });
@@ -87,14 +98,13 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
       setTimeout(() => this.startAutoSync(), 3e3);
     }
   }
-  // fix #8: onunload silently clears interval, no Notice spam on Obsidian close
   onunload() {
     if (this.syncIntervalId !== null) {
       clearInterval(this.syncIntervalId);
       this.syncIntervalId = null;
     }
   }
-  // ── HTTP helpers (requestUrl only — works on all platforms) ───────────
+  // ── HTTP helpers ──────────────────────────────────────────────────────
   async apiGet(url, token) {
     const resp = await (0, import_obsidian.requestUrl)({ url, headers: { Authorization: "Bearer " + token } });
     if (resp.status >= 400)
@@ -112,7 +122,6 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
       throw new Error(`POST failed ${resp.status}: ${resp.text}`);
     return JSON.parse(resp.text);
   }
-  // fix #11: apiDelete now checks response status
   async apiDelete(url, token) {
     const resp = await (0, import_obsidian.requestUrl)({ url, method: "DELETE", headers: { Authorization: "Bearer " + token } });
     if (resp.status >= 400 && resp.status !== 404)
@@ -153,7 +162,7 @@ Content-Type: application/octet-stream\r
       throw new Error(`Upload failed ${resp.status}: ${resp.text}`);
     return JSON.parse(resp.text);
   }
-  // ── Auto-Updater ──────────────────────────────────────────────
+  // ── Auto-Updater ──────────────────────────────────────────────────────
   async checkForUpdate() {
     try {
       const resp = await (0, import_obsidian.requestUrl)({ url: GITHUB_VERSION_URL + "?t=" + Date.now() });
@@ -206,19 +215,17 @@ Content-Type: application/octet-stream\r
   errMsg(e) {
     return (e instanceof Error ? e.message : String(e)) || "Unknown error";
   }
-  // fix #3: saveSettings always merges with existing data — never wipes lastSynced
   async saveSettings() {
     var _a;
     const current = (_a = await this.loadData()) != null ? _a : {};
-    await this.saveData({ ...current, ...this.settings, lastSynced: this.lastSynced });
+    await this.saveData({ ...current, ...this.settings, lastSynced: this.lastSynced, driveChangesPageToken: this.driveChangesPageToken });
   }
   async saveLastSynced() {
     var _a;
     const current = (_a = await this.loadData()) != null ? _a : {};
-    await this.saveData({ ...current, lastSynced: this.lastSynced });
+    await this.saveData({ ...current, lastSynced: this.lastSynced, driveChangesPageToken: this.driveChangesPageToken });
   }
-  // ── OAuth ─────────────────────────────────────────────────────────
-  // fix #12: all concurrent callers await same single refresh promise
+  // ── OAuth ─────────────────────────────────────────────────────────────
   async getAccessToken() {
     if (this.accessToken && Date.now() < this.accessTokenExpiry - 6e4)
       return this.accessToken;
@@ -251,7 +258,7 @@ Content-Type: application/octet-stream\r
       this.accessTokenRefreshPromise = null;
     }
   }
-  // ── Drive Folder ─────────────────────────────────────────────────────
+  // ── Drive Folder ──────────────────────────────────────────────────────
   async ensureDriveFolder() {
     var _a;
     if (this.driveFolderId)
@@ -274,7 +281,50 @@ Content-Type: application/octet-stream\r
     this.driveFolderId = folder.id;
     return this.driveFolderId;
   }
-  // ── List all Drive files (paginated) ─────────────────────────────────
+  // ── Delta Sync: Drive Changes API ─────────────────────────────────────
+  // Gets a fresh start page token from Drive (called once on first ever sync)
+  async fetchStartPageToken() {
+    const token = await this.getAccessToken();
+    const data = await this.apiGet("https://www.googleapis.com/drive/v3/changes/startPageToken", token);
+    return data.startPageToken;
+  }
+  // Returns list of changed files in our sync folder since driveChangesPageToken,
+  // and updates driveChangesPageToken to the new token for next time.
+  async fetchDeltaChanges() {
+    const token = await this.getAccessToken();
+    const folderId = await this.ensureDriveFolder();
+    const changes = [];
+    let pageToken = this.driveChangesPageToken;
+    let newPageToken = pageToken;
+    do {
+      const url = `https://www.googleapis.com/drive/v3/changes?pageToken=${encodeURIComponent(pageToken)}&fields=nextPageToken,newStartPageToken,changes(removed,fileId,file(id,name,parents,trashed,modifiedTime))&includeRemoved=true`;
+      const data = await this.apiGet(url, token);
+      for (const change of data.changes || []) {
+        const f = change.file;
+        if (!f)
+          continue;
+        const inFolder = f.parents && f.parents.includes(folderId);
+        if (!inFolder && !change.removed)
+          continue;
+        const filePath = decodePath(f.name || "");
+        changes.push({
+          filePath,
+          fileId: change.fileId,
+          removed: !!(change.removed || f.trashed),
+          modifiedTime: f.modifiedTime ? new Date(f.modifiedTime).getTime() : 0
+        });
+      }
+      if (data.nextPageToken) {
+        pageToken = data.nextPageToken;
+      } else {
+        newPageToken = data.newStartPageToken || pageToken;
+        break;
+      }
+    } while (true);
+    this.driveChangesPageToken = newPageToken;
+    return changes;
+  }
+  // ── Full file listing (used only on first sync / token missing) ───────
   async listDriveFiles() {
     const token = await this.getAccessToken();
     const folderId = await this.ensureDriveFolder();
@@ -290,7 +340,60 @@ Content-Type: application/octet-stream\r
     } while (pageToken);
     return allFiles;
   }
-  // ── Two-way sync ─────────────────────────────────────────────────────
+  // ── Conflict-safe file write ──────────────────────────────────────────
+  // If local file was edited since our last sync, save both versions.
+  async writeFileConflictSafe(filePath, buffer, driveModifiedTime) {
+    var _a;
+    const localFile = this.app.vault.getAbstractFileByPath(filePath);
+    const lastSync = (_a = this.lastSynced[filePath]) != null ? _a : 0;
+    const dir = filePath.includes("/") ? filePath.substring(0, filePath.lastIndexOf("/")) : null;
+    if (dir) {
+      try {
+        await this.app.vault.createFolder(dir);
+      } catch (e) {
+      }
+    }
+    if (localFile instanceof import_obsidian.TFile) {
+      const localMtime = localFile.stat.mtime;
+      if (lastSync > 0 && localMtime > lastSync && driveModifiedTime > lastSync) {
+        const conflictPath = conflictName(filePath);
+        const conflictDir = conflictPath.includes("/") ? conflictPath.substring(0, conflictPath.lastIndexOf("/")) : null;
+        if (conflictDir) {
+          try {
+            await this.app.vault.createFolder(conflictDir);
+          } catch (e) {
+          }
+        }
+        this.downloading.add(conflictPath);
+        try {
+          await this.app.vault.createBinary(conflictPath, buffer);
+        } catch (e) {
+          const existing = this.app.vault.getAbstractFileByPath(conflictPath);
+          if (existing instanceof import_obsidian.TFile)
+            await this.app.vault.modifyBinary(existing, buffer);
+        } finally {
+          this.downloading.delete(conflictPath);
+        }
+        new import_obsidian.Notice(`\u26A0\uFE0F Conflict detected: "${filePath}"
+Drive version saved as "${conflictPath}"`);
+        return;
+      }
+      this.downloading.add(filePath);
+      try {
+        await this.app.vault.modifyBinary(localFile, buffer);
+      } finally {
+        this.downloading.delete(filePath);
+      }
+    } else {
+      this.downloading.add(filePath);
+      try {
+        await this.app.vault.createBinary(filePath, buffer);
+      } finally {
+        this.downloading.delete(filePath);
+      }
+    }
+  }
+  // ── Two-way sync (delta-aware) ────────────────────────────────────────
   async fullTwoWaySync() {
     if (!this.isConfigured()) {
       new import_obsidian.Notice("\u26A0\uFE0F GDrive Sync: Please enter credentials first.");
@@ -302,53 +405,75 @@ Content-Type: application/octet-stream\r
     this.setStatus("\u{1F504} Syncing...");
     try {
       await this.ensureDriveFolder();
-      const driveFiles = await this.listDriveFiles();
-      const driveMap = {};
-      for (const df of driveFiles) {
-        const realPath = decodePath(df.name);
-        driveMap[realPath] = { id: df.id, modifiedTime: new Date(df.modifiedTime).getTime() };
-      }
       const token = await this.getAccessToken();
       let downloaded = 0;
-      const driveEntries = Object.entries(driveMap);
-      for (let i = 0; i < driveEntries.length; i += BATCH_SIZE) {
-        const batch = driveEntries.slice(i, i + BATCH_SIZE);
-        await Promise.all(batch.map(async ([filePath, driveInfo]) => {
-          const localFile = this.app.vault.getAbstractFileByPath(filePath);
-          const localMtime = localFile instanceof import_obsidian.TFile ? localFile.stat.mtime : 0;
-          if (driveInfo.modifiedTime > localMtime) {
-            this.downloading.add(filePath);
-            try {
-              const buffer = await this.apiDownload(
-                `https://www.googleapis.com/drive/v3/files/${driveInfo.id}?alt=media`,
-                token
-              );
-              const dir = filePath.includes("/") ? filePath.substring(0, filePath.lastIndexOf("/")) : null;
-              if (dir) {
-                try {
-                  await this.app.vault.createFolder(dir);
-                } catch (e) {
-                }
+      if (!this.driveChangesPageToken) {
+        const driveFiles = await this.listDriveFiles();
+        const driveMap = {};
+        for (const df of driveFiles) {
+          driveMap[decodePath(df.name)] = { id: df.id, modifiedTime: new Date(df.modifiedTime).getTime() };
+        }
+        const driveEntries = Object.entries(driveMap);
+        for (let i = 0; i < driveEntries.length; i += BATCH_SIZE) {
+          const batch = driveEntries.slice(i, i + BATCH_SIZE);
+          await Promise.all(batch.map(async ([filePath, driveInfo]) => {
+            const localFile = this.app.vault.getAbstractFileByPath(filePath);
+            const localMtime = localFile instanceof import_obsidian.TFile ? localFile.stat.mtime : 0;
+            if (driveInfo.modifiedTime > localMtime) {
+              try {
+                const buffer = await this.apiDownload(
+                  `https://www.googleapis.com/drive/v3/files/${driveInfo.id}?alt=media`,
+                  token
+                );
+                await this.writeFileConflictSafe(filePath, buffer, driveInfo.modifiedTime);
+                this.lastSynced[filePath] = driveInfo.modifiedTime;
+                downloaded++;
+              } catch (e) {
+                console.error("Download error:", filePath, this.errMsg(e));
               }
-              if (localFile instanceof import_obsidian.TFile)
-                await this.app.vault.modifyBinary(localFile, buffer);
-              else
-                await this.app.vault.createBinary(filePath, buffer);
-              this.lastSynced[filePath] = driveInfo.modifiedTime;
-              downloaded++;
+            }
+          }));
+          this.setStatus(`\u2B07\uFE0F ${downloaded}/${driveEntries.length}...`);
+        }
+        this.driveChangesPageToken = await this.fetchStartPageToken();
+      } else {
+        const changes = await this.fetchDeltaChanges();
+        const relevant = changes.filter((c) => !c.removed);
+        const removed = changes.filter((c) => c.removed);
+        for (const c of removed) {
+          const localFile = this.app.vault.getAbstractFileByPath(c.filePath);
+          if (localFile instanceof import_obsidian.TFile) {
+            try {
+              await this.app.vault.delete(localFile);
+              delete this.lastSynced[c.filePath];
             } catch (e) {
-              console.error("Download error:", filePath, this.errMsg(e));
-            } finally {
-              this.downloading.delete(filePath);
+              console.error("Local delete error:", c.filePath, this.errMsg(e));
             }
           }
-        }));
-        this.setStatus(`\u2B07\uFE0F ${downloaded}/${driveEntries.length}...`);
+        }
+        for (let i = 0; i < relevant.length; i += BATCH_SIZE) {
+          const batch = relevant.slice(i, i + BATCH_SIZE);
+          await Promise.all(batch.map(async (c) => {
+            try {
+              const buffer = await this.apiDownload(
+                `https://www.googleapis.com/drive/v3/files/${c.fileId}?alt=media`,
+                token
+              );
+              await this.writeFileConflictSafe(c.filePath, buffer, c.modifiedTime);
+              this.lastSynced[c.filePath] = c.modifiedTime;
+              downloaded++;
+            } catch (e) {
+              console.error("Delta download error:", c.filePath, this.errMsg(e));
+            }
+          }));
+          this.setStatus(`\u2B07\uFE0F ${downloaded}/${relevant.length}...`);
+        }
       }
       const localFiles = this.app.vault.getFiles();
       const toUpload = localFiles.filter((f) => {
-        const driveInfo = driveMap[f.path];
-        return !driveInfo || f.stat.mtime > driveInfo.modifiedTime;
+        var _a;
+        const lastSync = (_a = this.lastSynced[f.path]) != null ? _a : 0;
+        return f.stat.mtime > lastSync;
       });
       let uploaded = 0;
       for (let i = 0; i < toUpload.length; i += BATCH_SIZE) {
@@ -369,7 +494,7 @@ Content-Type: application/octet-stream\r
       this.isSyncing = false;
     }
   }
-  // ── Upload single file — returns true on success ───────────────────────
+  // ── Upload single file ────────────────────────────────────────────────
   async uploadFile(file, force = false) {
     var _a, _b;
     if (!this.isConfigured())
@@ -397,7 +522,7 @@ Content-Type: application/octet-stream\r
       return false;
     }
   }
-  // ── Delete from Drive ────────────────────────────────────────────────
+  // ── Delete from Drive ─────────────────────────────────────────────────
   async deleteFromDrive(filePath) {
     var _a, _b;
     if (!this.isConfigured())
@@ -420,7 +545,7 @@ Content-Type: application/octet-stream\r
       console.error("GDrive delete error:", this.errMsg(e));
     }
   }
-  // ── Download All ─────────────────────────────────────────────────────
+  // ── Download All (force full re-download) ─────────────────────────────
   async downloadAll() {
     if (!this.isConfigured()) {
       new import_obsidian.Notice("\u26A0\uFE0F Please enter credentials first.");
@@ -440,33 +565,21 @@ Content-Type: application/octet-stream\r
         const batch = driveFiles.slice(i, i + BATCH_SIZE);
         await Promise.all(batch.map(async (df) => {
           const realPath = decodePath(df.name);
-          this.downloading.add(realPath);
           try {
             const buffer = await this.apiDownload(
               `https://www.googleapis.com/drive/v3/files/${df.id}?alt=media`,
               token
             );
-            const dir = realPath.includes("/") ? realPath.substring(0, realPath.lastIndexOf("/")) : null;
-            if (dir) {
-              try {
-                await this.app.vault.createFolder(dir);
-              } catch (e) {
-              }
-            }
-            const existing = this.app.vault.getAbstractFileByPath(realPath);
-            if (existing instanceof import_obsidian.TFile)
-              await this.app.vault.modifyBinary(existing, buffer);
-            else
-              await this.app.vault.createBinary(realPath, buffer);
+            await this.writeFileConflictSafe(realPath, buffer, new Date(df.modifiedTime).getTime());
             count++;
           } catch (e) {
             console.error("Download error:", realPath, this.errMsg(e));
-          } finally {
-            this.downloading.delete(realPath);
           }
         }));
         this.setStatus(`\u2B07\uFE0F ${count}/${driveFiles.length}...`);
       }
+      this.driveChangesPageToken = await this.fetchStartPageToken();
+      await this.saveLastSynced();
       this.setStatus(`\u2705 Downloaded ${count} files`);
       new import_obsidian.Notice(`\u2705 Downloaded ${count} files from Google Drive!`);
     } catch (e) {
@@ -501,10 +614,11 @@ Content-Type: application/octet-stream\r
     }
   }
   async loadSettings() {
-    var _a, _b;
+    var _a, _b, _c;
     const saved = (_a = await this.loadData()) != null ? _a : {};
     this.settings = Object.assign({}, DEFAULT_SETTINGS, saved);
     this.lastSynced = (_b = saved.lastSynced) != null ? _b : {};
+    this.driveChangesPageToken = (_c = saved.driveChangesPageToken) != null ? _c : "";
   }
 };
 var GDriveSyncSettingTab = class extends import_obsidian.PluginSettingTab {
@@ -546,7 +660,7 @@ var GDriveSyncSettingTab = class extends import_obsidian.PluginSettingTab {
     new import_obsidian.Setting(containerEl).setName("Start auto-sync").addButton((b) => b.setButtonText("\u25B6 Start").setCta().onClick(() => this.plugin.startAutoSync()));
     new import_obsidian.Setting(containerEl).setName("Stop auto-sync").addButton((b) => b.setButtonText("\u23F8 Stop").onClick(() => this.plugin.stopAutoSync()));
     new import_obsidian.Setting(containerEl).setName("Sync now").setDesc("Upload local changes and download Drive changes.").addButton((b) => b.setButtonText("\u{1F504} Two-Way Sync").onClick(() => this.plugin.fullTwoWaySync()));
-    new import_obsidian.Setting(containerEl).setName("Download from Drive").setDesc("Force download all files from Drive.").addButton((b) => b.setButtonText("\u2B07 Download All").onClick(() => this.plugin.downloadAll()));
+    new import_obsidian.Setting(containerEl).setName("Download from Drive").setDesc("Force re-download all files from Drive.").addButton((b) => b.setButtonText("\u2B07 Download All").onClick(() => this.plugin.downloadAll()));
     new import_obsidian.Setting(containerEl).setName("Check for update").setDesc("Manually check GitHub for a newer version.").addButton((b) => b.setButtonText("\u{1F504} Check Update").onClick(() => this.plugin.checkForUpdate()));
   }
 };
