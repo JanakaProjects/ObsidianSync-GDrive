@@ -23,8 +23,8 @@ __export(main_exports, {
 });
 module.exports = __toCommonJS(main_exports);
 var import_obsidian = require("obsidian");
-var GITHUB_VERSION_URL = "https://raw.githubusercontent.com/JanakaProjects/obsidian-gdrive-sync/main/manifest.json";
-var GITHUB_MAIN_JS_URL = "https://raw.githubusercontent.com/JanakaProjects/obsidian-gdrive-sync/main/main.js";
+var GITHUB_VERSION_URL = "https://raw.githubusercontent.com/JanakaProjects/ObsidianSync-GDrive/main/manifest.json";
+var GITHUB_MAIN_JS_URL = "https://raw.githubusercontent.com/JanakaProjects/ObsidianSync-GDrive/main/main.js";
 var BATCH_SIZE = 5;
 var SYNC_INTERVAL_PRESETS = [1, 5, 10, 30, 60, 120, 300, 600, 900, 1800];
 function secondsToLabel(s) {
@@ -339,7 +339,7 @@ Content-Type: application/octet-stream\r
     this.driveChangesPageToken = newPageToken;
     return changes;
   }
-  // ── Full file listing (first sync / no token) ───────────────────────────
+  // ── Full file listing (first sync / no token) ─────────────────────────
   async listDriveFiles() {
     const token = await this.getAccessToken();
     const folderId = await this.ensureDriveFolder();
