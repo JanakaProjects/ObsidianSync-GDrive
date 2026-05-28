@@ -1,8 +1,6 @@
-var __create = Object.create;
 var __defProp = Object.defineProperty;
 var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
 var __getOwnPropNames = Object.getOwnPropertyNames;
-var __getProtoOf = Object.getPrototypeOf;
 var __hasOwnProp = Object.prototype.hasOwnProperty;
 var __export = (target, all) => {
   for (var name in all)
@@ -16,14 +14,6 @@ var __copyProps = (to, from, except, desc) => {
   }
   return to;
 };
-var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__getProtoOf(mod)) : {}, __copyProps(
-  // If the importer is in node compatibility mode or this is not an ESM
-  // file that has been converted to a CommonJS file using a Babel-
-  // compatible transform (i.e. "__esModule" has not been set), then set
-  // "default" to the CommonJS "module.exports" for node compatibility.
-  isNodeMode || !mod || !mod.__esModule ? __defProp(target, "default", { value: mod, enumerable: true }) : target,
-  mod
-));
 var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: true }), mod);
 
 // main.ts
@@ -33,11 +23,15 @@ __export(main_exports, {
 });
 module.exports = __toCommonJS(main_exports);
 var import_obsidian = require("obsidian");
-var fs = __toESM(require("fs"));
-var path = __toESM(require("path"));
 var GITHUB_VERSION_URL = "https://raw.githubusercontent.com/JanakaProjects/obsidian-gdrive-sync/main/manifest.json";
 var GITHUB_MAIN_JS_URL = "https://raw.githubusercontent.com/JanakaProjects/obsidian-gdrive-sync/main/main.js";
 var BATCH_SIZE = 5;
+function encodePath(vaultPath) {
+  return vaultPath.replace(/___/g, "__TRIPLEUNDERSCORE__").replace(/\//g, "___");
+}
+function decodePath(driveName) {
+  return driveName.replace(/___/g, "/").replace(/__TRIPLEUNDERSCORE__/g, "___");
+}
 var DEFAULT_SETTINGS = {
   clientId: "",
   clientSecret: "",
@@ -51,27 +45,31 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
     super(...arguments);
     this.accessToken = "";
     this.accessTokenExpiry = 0;
+    // fix #12: serialise concurrent token refreshes
+    this.accessTokenRefreshPromise = null;
     this.driveFolderId = "";
     this.syncIntervalId = null;
     this.isSyncing = false;
     this.lastSynced = {};
+    // fix #6: paths currently being written from Drive so watcher ignores them
+    this.downloading = /* @__PURE__ */ new Set();
   }
   async onload() {
-    var _a;
-    await this.loadSettings();
-    const saved = await this.loadData();
-    this.lastSynced = (_a = saved == null ? void 0 : saved.lastSynced) != null ? _a : {};
+    var _a, _b;
+    const saved = (_a = await this.loadData()) != null ? _a : {};
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, saved);
+    this.lastSynced = (_b = saved.lastSynced) != null ? _b : {};
     this.statusBarItem = this.addStatusBarItem();
     this.setStatus("\u23F8 GDrive Sync idle");
     this.addCommand({ id: "sync-now", name: "Sync vault now", callback: () => this.fullTwoWaySync() });
     this.addCommand({ id: "stop-sync", name: "Stop auto-sync", callback: () => this.stopAutoSync() });
     this.addSettingTab(new GDriveSyncSettingTab(this.app, this));
     this.registerEvent(this.app.vault.on("modify", (file) => {
-      if (file instanceof import_obsidian.TFile)
+      if (file instanceof import_obsidian.TFile && !this.downloading.has(file.path))
         this.uploadFile(file);
     }));
     this.registerEvent(this.app.vault.on("create", (file) => {
-      if (file instanceof import_obsidian.TFile)
+      if (file instanceof import_obsidian.TFile && !this.downloading.has(file.path))
         this.uploadFile(file);
     }));
     this.registerEvent(this.app.vault.on("delete", (file) => {
@@ -89,14 +87,18 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
       setTimeout(() => this.startAutoSync(), 3e3);
     }
   }
+  // fix #8: onunload silently clears interval, no Notice spam on Obsidian close
   onunload() {
-    this.stopAutoSync();
+    if (this.syncIntervalId !== null) {
+      clearInterval(this.syncIntervalId);
+      this.syncIntervalId = null;
+    }
   }
-  // ── Helper: use requestUrl for all HTTP (works on desktop + mobile/iSH) ──────
+  // ── HTTP helpers (requestUrl only — works on all platforms) ───────────
   async apiGet(url, token) {
     const resp = await (0, import_obsidian.requestUrl)({ url, headers: { Authorization: "Bearer " + token } });
     if (resp.status >= 400)
-      throw new Error(`GET ${url} failed: ${resp.status} ${resp.text}`);
+      throw new Error(`GET failed ${resp.status}: ${resp.text}`);
     return JSON.parse(resp.text);
   }
   async apiPost(url, token, body) {
@@ -107,29 +109,29 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
       body: JSON.stringify(body)
     });
     if (resp.status >= 400)
-      throw new Error(`POST ${url} failed: ${resp.status} ${resp.text}`);
+      throw new Error(`POST failed ${resp.status}: ${resp.text}`);
     return JSON.parse(resp.text);
   }
+  // fix #11: apiDelete now checks response status
   async apiDelete(url, token) {
-    await (0, import_obsidian.requestUrl)({ url, method: "DELETE", headers: { Authorization: "Bearer " + token } });
+    const resp = await (0, import_obsidian.requestUrl)({ url, method: "DELETE", headers: { Authorization: "Bearer " + token } });
+    if (resp.status >= 400 && resp.status !== 404)
+      throw new Error(`DELETE failed ${resp.status}: ${resp.text}`);
   }
   async apiDownload(url, token) {
     const resp = await (0, import_obsidian.requestUrl)({ url, headers: { Authorization: "Bearer " + token } });
     if (resp.status >= 400)
-      throw new Error(`Download failed: ${resp.status}`);
+      throw new Error(`Download failed ${resp.status}: ${resp.text}`);
     return resp.arrayBuffer;
   }
   async apiUpload(url, method, token, metadata, content) {
-    const boundary = "gdrivesync_boundary_" + Date.now();
-    const metaStr = JSON.stringify(metadata);
+    const boundary = "gdrivesync_" + Date.now();
     const enc = new TextEncoder();
-    const metaPart = enc.encode(
-      `--${boundary}\r
+    const metaPart = enc.encode(`--${boundary}\r
 Content-Type: application/json; charset=UTF-8\r
 \r
-${metaStr}\r
-`
-    );
+${JSON.stringify(metadata)}\r
+`);
     const filePart = enc.encode(`--${boundary}\r
 Content-Type: application/octet-stream\r
 \r
@@ -144,17 +146,14 @@ Content-Type: application/octet-stream\r
     const resp = await (0, import_obsidian.requestUrl)({
       url,
       method,
-      headers: {
-        Authorization: "Bearer " + token,
-        "Content-Type": `multipart/related; boundary=${boundary}`
-      },
+      headers: { Authorization: "Bearer " + token, "Content-Type": `multipart/related; boundary=${boundary}` },
       body: body.buffer
     });
     if (resp.status >= 400)
-      throw new Error(`Upload failed: ${resp.status} ${resp.text}`);
+      throw new Error(`Upload failed ${resp.status}: ${resp.text}`);
     return JSON.parse(resp.text);
   }
-  // ── Auto-Updater ───────────────────────────────────────────────────────
+  // ── Auto-Updater ──────────────────────────────────────────────
   async checkForUpdate() {
     try {
       const resp = await (0, import_obsidian.requestUrl)({ url: GITHUB_VERSION_URL + "?t=" + Date.now() });
@@ -171,12 +170,14 @@ Content-Type: application/octet-stream\r
     try {
       let written = false;
       try {
+        const fs = require("fs");
+        const nodePath = require("path");
         const basePath = this.app.vault.adapter.basePath;
-        const pluginDir = path.join(basePath, ".obsidian", "plugins", this.manifest.id);
+        const pluginDir = nodePath.join(basePath, ".obsidian", "plugins", this.manifest.id);
         const jsResp = await (0, import_obsidian.requestUrl)({ url: GITHUB_MAIN_JS_URL + "?t=" + Date.now() });
-        fs.writeFileSync(path.join(pluginDir, "main.js"), jsResp.text, "utf8");
+        fs.writeFileSync(nodePath.join(pluginDir, "main.js"), jsResp.text, "utf8");
         const mResp = await (0, import_obsidian.requestUrl)({ url: GITHUB_VERSION_URL + "?t=" + Date.now() });
-        fs.writeFileSync(path.join(pluginDir, "manifest.json"), mResp.text, "utf8");
+        fs.writeFileSync(nodePath.join(pluginDir, "manifest.json"), mResp.text, "utf8");
         written = true;
       } catch (e) {
       }
@@ -205,36 +206,52 @@ Content-Type: application/octet-stream\r
   errMsg(e) {
     return (e instanceof Error ? e.message : String(e)) || "Unknown error";
   }
+  // fix #3: saveSettings always merges with existing data — never wipes lastSynced
+  async saveSettings() {
+    var _a;
+    const current = (_a = await this.loadData()) != null ? _a : {};
+    await this.saveData({ ...current, ...this.settings, lastSynced: this.lastSynced });
+  }
   async saveLastSynced() {
     var _a;
     const current = (_a = await this.loadData()) != null ? _a : {};
     await this.saveData({ ...current, lastSynced: this.lastSynced });
   }
-  // ── OAuth (uses requestUrl — works on all platforms) ──────────────────────
+  // ── OAuth ─────────────────────────────────────────────────────────
+  // fix #12: all concurrent callers await same single refresh promise
   async getAccessToken() {
     if (this.accessToken && Date.now() < this.accessTokenExpiry - 6e4)
       return this.accessToken;
-    const resp = await (0, import_obsidian.requestUrl)({
-      url: "https://oauth2.googleapis.com/token",
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        client_id: this.settings.clientId,
-        client_secret: this.settings.clientSecret,
-        refresh_token: this.settings.refreshToken,
-        grant_type: "refresh_token"
-      }).toString()
-    });
-    if (resp.status >= 400)
-      throw new Error("Failed to refresh token: " + resp.text);
-    const data = JSON.parse(resp.text);
-    if (!data.access_token)
-      throw new Error("No access_token in response: " + resp.text);
-    this.accessToken = data.access_token;
-    this.accessTokenExpiry = Date.now() + data.expires_in * 1e3;
-    return this.accessToken;
+    if (this.accessTokenRefreshPromise)
+      return this.accessTokenRefreshPromise;
+    this.accessTokenRefreshPromise = (async () => {
+      const resp = await (0, import_obsidian.requestUrl)({
+        url: "https://oauth2.googleapis.com/token",
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          client_id: this.settings.clientId,
+          client_secret: this.settings.clientSecret,
+          refresh_token: this.settings.refreshToken,
+          grant_type: "refresh_token"
+        }).toString()
+      });
+      if (resp.status >= 400)
+        throw new Error("Token refresh failed: " + resp.text);
+      const data = JSON.parse(resp.text);
+      if (!data.access_token)
+        throw new Error("No access_token in response: " + resp.text);
+      this.accessToken = data.access_token;
+      this.accessTokenExpiry = Date.now() + data.expires_in * 1e3;
+      return this.accessToken;
+    })();
+    try {
+      return await this.accessTokenRefreshPromise;
+    } finally {
+      this.accessTokenRefreshPromise = null;
+    }
   }
-  // ── Drive Folder ──────────────────────────────────────────────────────────
+  // ── Drive Folder ─────────────────────────────────────────────────────
   async ensureDriveFolder() {
     var _a;
     if (this.driveFolderId)
@@ -257,7 +274,7 @@ Content-Type: application/octet-stream\r
     this.driveFolderId = folder.id;
     return this.driveFolderId;
   }
-  // ── List ALL files on Drive (no limit, paginated) ─────────────────────────
+  // ── List all Drive files (paginated) ─────────────────────────────────
   async listDriveFiles() {
     const token = await this.getAccessToken();
     const folderId = await this.ensureDriveFolder();
@@ -273,7 +290,7 @@ Content-Type: application/octet-stream\r
     } while (pageToken);
     return allFiles;
   }
-  // ── Two-way sync ───────────────────────────────────────────────────────────
+  // ── Two-way sync ─────────────────────────────────────────────────────
   async fullTwoWaySync() {
     if (!this.isConfigured()) {
       new import_obsidian.Notice("\u26A0\uFE0F GDrive Sync: Please enter credentials first.");
@@ -288,7 +305,7 @@ Content-Type: application/octet-stream\r
       const driveFiles = await this.listDriveFiles();
       const driveMap = {};
       for (const df of driveFiles) {
-        const realPath = df.name.replace(/___/g, "/");
+        const realPath = decodePath(df.name);
         driveMap[realPath] = { id: df.id, modifiedTime: new Date(df.modifiedTime).getTime() };
       }
       const token = await this.getAccessToken();
@@ -300,6 +317,7 @@ Content-Type: application/octet-stream\r
           const localFile = this.app.vault.getAbstractFileByPath(filePath);
           const localMtime = localFile instanceof import_obsidian.TFile ? localFile.stat.mtime : 0;
           if (driveInfo.modifiedTime > localMtime) {
+            this.downloading.add(filePath);
             try {
               const buffer = await this.apiDownload(
                 `https://www.googleapis.com/drive/v3/files/${driveInfo.id}?alt=media`,
@@ -316,9 +334,12 @@ Content-Type: application/octet-stream\r
                 await this.app.vault.modifyBinary(localFile, buffer);
               else
                 await this.app.vault.createBinary(filePath, buffer);
+              this.lastSynced[filePath] = driveInfo.modifiedTime;
               downloaded++;
             } catch (e) {
               console.error("Download error:", filePath, this.errMsg(e));
+            } finally {
+              this.downloading.delete(filePath);
             }
           }
         }));
@@ -332,8 +353,8 @@ Content-Type: application/octet-stream\r
       let uploaded = 0;
       for (let i = 0; i < toUpload.length; i += BATCH_SIZE) {
         const batch = toUpload.slice(i, i + BATCH_SIZE);
-        await Promise.all(batch.map((f) => this.uploadFile(f, true)));
-        uploaded += batch.length;
+        const results = await Promise.all(batch.map((f) => this.uploadFile(f, true)));
+        uploaded += results.filter(Boolean).length;
         this.setStatus(`\u2B06\uFE0F ${uploaded}/${toUpload.length}...`);
       }
       await this.saveLastSynced();
@@ -344,21 +365,22 @@ Content-Type: application/octet-stream\r
     } catch (e) {
       this.setStatus("\u274C Sync failed");
       new import_obsidian.Notice("\u274C GDrive Sync failed: " + this.errMsg(e));
+    } finally {
+      this.isSyncing = false;
     }
-    this.isSyncing = false;
   }
-  // ── Upload single file ────────────────────────────────────────────────────
+  // ── Upload single file — returns true on success ───────────────────────
   async uploadFile(file, force = false) {
     var _a, _b;
     if (!this.isConfigured())
-      return;
+      return false;
     if (!force && this.lastSynced[file.path] && this.lastSynced[file.path] >= file.stat.mtime)
-      return;
+      return false;
     try {
       const token = await this.getAccessToken();
       const folderId = await this.ensureDriveFolder();
       const content = await this.app.vault.readBinary(file);
-      const safeName = file.path.replace(/\//g, "___");
+      const safeName = encodePath(file.path);
       const query = `name='${safeName}' and '${folderId}' in parents and trashed=false`;
       const searchData = await this.apiGet(
         `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(query)}&fields=files(id)`,
@@ -369,11 +391,13 @@ Content-Type: application/octet-stream\r
       const uploadUrl = existingId ? `https://www.googleapis.com/upload/drive/v3/files/${existingId}?uploadType=multipart` : `https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart`;
       await this.apiUpload(uploadUrl, existingId ? "PATCH" : "POST", token, metadata, content);
       this.lastSynced[file.path] = file.stat.mtime;
+      return true;
     } catch (e) {
       console.error("GDrive upload error:", file.path, this.errMsg(e));
+      return false;
     }
   }
-  // ── Delete from Drive ─────────────────────────────────────────────────────
+  // ── Delete from Drive ────────────────────────────────────────────────
   async deleteFromDrive(filePath) {
     var _a, _b;
     if (!this.isConfigured())
@@ -381,7 +405,7 @@ Content-Type: application/octet-stream\r
     try {
       const token = await this.getAccessToken();
       const folderId = await this.ensureDriveFolder();
-      const safeName = filePath.replace(/\//g, "___");
+      const safeName = encodePath(filePath);
       const query = `name='${safeName}' and '${folderId}' in parents and trashed=false`;
       const searchData = await this.apiGet(
         `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(query)}&fields=files(id)`,
@@ -396,14 +420,17 @@ Content-Type: application/octet-stream\r
       console.error("GDrive delete error:", this.errMsg(e));
     }
   }
-  syncAll() {
-    return this.fullTwoWaySync();
-  }
+  // ── Download All ─────────────────────────────────────────────────────
   async downloadAll() {
     if (!this.isConfigured()) {
       new import_obsidian.Notice("\u26A0\uFE0F Please enter credentials first.");
       return;
     }
+    if (this.isSyncing) {
+      new import_obsidian.Notice("\u26A0\uFE0F Sync already in progress, please wait.");
+      return;
+    }
+    this.isSyncing = true;
     this.setStatus("\u2B07\uFE0F Downloading from Drive...");
     try {
       const token = await this.getAccessToken();
@@ -412,7 +439,8 @@ Content-Type: application/octet-stream\r
       for (let i = 0; i < driveFiles.length; i += BATCH_SIZE) {
         const batch = driveFiles.slice(i, i + BATCH_SIZE);
         await Promise.all(batch.map(async (df) => {
-          const realPath = df.name.replace(/___/g, "/");
+          const realPath = decodePath(df.name);
+          this.downloading.add(realPath);
           try {
             const buffer = await this.apiDownload(
               `https://www.googleapis.com/drive/v3/files/${df.id}?alt=media`,
@@ -433,6 +461,8 @@ Content-Type: application/octet-stream\r
             count++;
           } catch (e) {
             console.error("Download error:", realPath, this.errMsg(e));
+          } finally {
+            this.downloading.delete(realPath);
           }
         }));
         this.setStatus(`\u2B07\uFE0F ${count}/${driveFiles.length}...`);
@@ -442,12 +472,23 @@ Content-Type: application/octet-stream\r
     } catch (e) {
       this.setStatus("\u274C Download failed");
       new import_obsidian.Notice("\u274C Download failed: " + this.errMsg(e));
+    } finally {
+      this.isSyncing = false;
     }
   }
   startAutoSync() {
-    this.stopAutoSync();
+    if (this.syncIntervalId !== null) {
+      clearInterval(this.syncIntervalId);
+      this.syncIntervalId = null;
+    }
     this.fullTwoWaySync();
-    this.syncIntervalId = window.setInterval(() => this.fullTwoWaySync(), this.settings.syncIntervalSeconds * 1e3);
+    const ms = Math.max(1, this.settings.syncIntervalSeconds) * 1e3;
+    this.syncIntervalId = window.setInterval(() => {
+      if (!this.isSyncing)
+        this.fullTwoWaySync();
+      else
+        console.log("GDrive Sync: sync in progress, skipping tick");
+    }, ms);
     this.setStatus("\u{1F504} Auto-sync active");
     new import_obsidian.Notice("\u2705 GDrive Auto-Sync started!");
   }
@@ -460,10 +501,10 @@ Content-Type: application/octet-stream\r
     }
   }
   async loadSettings() {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
-  }
-  async saveSettings() {
-    await this.saveData(this.settings);
+    var _a, _b;
+    const saved = (_a = await this.loadData()) != null ? _a : {};
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, saved);
+    this.lastSynced = (_b = saved.lastSynced) != null ? _b : {};
   }
 };
 var GDriveSyncSettingTab = class extends import_obsidian.PluginSettingTab {
@@ -493,7 +534,7 @@ var GDriveSyncSettingTab = class extends import_obsidian.PluginSettingTab {
       this.plugin.driveFolderId = "";
       await this.plugin.saveSettings();
     }));
-    new import_obsidian.Setting(containerEl).setName("Auto-sync interval (seconds)").addSlider((s) => s.setLimits(10, 300, 10).setValue(this.plugin.settings.syncIntervalSeconds).setDynamicTooltip().onChange(async (v) => {
+    new import_obsidian.Setting(containerEl).setName("Auto-sync interval (seconds)").addSlider((s) => s.setLimits(1, 300, 1).setValue(this.plugin.settings.syncIntervalSeconds).setDynamicTooltip().onChange(async (v) => {
       this.plugin.settings.syncIntervalSeconds = v;
       await this.plugin.saveSettings();
     }));
