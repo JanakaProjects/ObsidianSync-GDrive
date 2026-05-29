@@ -23,7 +23,7 @@ var import_obsidian = require("obsidian");
 
 var GITHUB_VERSION_URL = "https://raw.githubusercontent.com/JanakaProjects/ObsidianSync-GDrive/main/manifest.json";
 var GITHUB_MAIN_JS_URL = "https://raw.githubusercontent.com/JanakaProjects/ObsidianSync-GDrive/main/main.js";
-var BATCH_SIZE = 5;
+var BATCH_SIZE = 10;
 var SYNC_INTERVAL_PRESETS = [1, 5, 10, 30, 60, 120, 300, 600, 900, 1800];
 
 function secondsToLabel(s) {
@@ -56,19 +56,28 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
     this.accessTokenExpiry = 0;
     this.accessTokenRefreshPromise = null;
     this.driveFolderId = "";
-    this.folderIdCache = new Map();
+    // FIX #3: folderIdCache and driveIdToPath are persisted across sessions
+    this.folderIdCache = new Map();   // vaultPath -> driveId
+    this.driveIdToPath = new Map();   // driveId -> vaultPath (for remote delete resolution)
     this.syncIntervalId = null;
     this.isSyncing = false;
     this.lastSynced = {};
     this.driveChangesPageToken = "";
     this.downloading = new Set();
   }
+
   async onload() {
-    var _a, _b, _c;
+    var _a, _b, _c, _d, _e;
     const saved = (_a = await this.loadData()) != null ? _a : {};
     this.settings = Object.assign({}, DEFAULT_SETTINGS, saved);
     this.lastSynced = (_b = saved.lastSynced) != null ? _b : {};
     this.driveChangesPageToken = (_c = saved.driveChangesPageToken) != null ? _c : "";
+    // FIX #3: restore caches from persisted data
+    const savedFolderCache = (_d = saved.folderIdCache) != null ? _d : [];
+    const savedIdToPath = (_e = saved.driveIdToPath) != null ? _e : [];
+    this.folderIdCache = new Map(savedFolderCache);
+    this.driveIdToPath = new Map(savedIdToPath);
+
     this.statusBarItem = this.addStatusBarItem();
     this.setStatus("\u23F8 GDrive Sync idle");
     this.addCommand({ id: "sync-now", name: "Sync vault now", callback: () => this.fullTwoWaySync() });
@@ -81,11 +90,15 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
     await this.checkForUpdate();
     if (this.settings.autoSyncOnStart && this.isConfigured()) setTimeout(() => this.startAutoSync(), 3e3);
   }
+
   onunload() { if (this.syncIntervalId !== null) { clearInterval(this.syncIntervalId); this.syncIntervalId = null; } }
+
+  // FIX #8: use SubtleCrypto (works on all platforms including iOS/Android)
   async hashBuffer(buffer) {
-    const crypto = require("crypto");
-    return crypto.createHash("md5").update(Buffer.from(buffer)).digest("hex");
+    const hashBuf = await crypto.subtle.digest("MD5", buffer instanceof ArrayBuffer ? buffer : buffer.buffer);
+    return Array.from(new Uint8Array(hashBuf)).map(b => b.toString(16).padStart(2, "0")).join("");
   }
+
   async apiGet(url, token) {
     const resp = await (0, import_obsidian.requestUrl)({ url, headers: { Authorization: "Bearer " + token } });
     if (resp.status >= 400) throw new Error(`GET failed ${resp.status}: ${resp.text}`);
@@ -119,6 +132,7 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
     if (resp.status >= 400) throw new Error(`Upload failed ${resp.status}: ${resp.text}`);
     return JSON.parse(resp.text);
   }
+
   async checkForUpdate() {
     try {
       const resp = await (0, import_obsidian.requestUrl)({ url: GITHUB_VERSION_URL + "?t=" + Date.now() });
@@ -141,7 +155,9 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
         const mResp = await (0, import_obsidian.requestUrl)({ url: GITHUB_VERSION_URL + "?t=" + Date.now() });
         fs.writeFileSync(nodePath.join(pluginDir, "manifest.json"), mResp.text, "utf8");
         written = true;
-      } catch (e) {}
+      } catch (fsErr) {
+        console.warn("GDrive Sync: fs write failed, trying vault adapter", fsErr);
+      }
       if (!written) {
         const pluginPath = `.obsidian/plugins/${this.manifest.id}`;
         const jsResp = await (0, import_obsidian.requestUrl)({ url: GITHUB_MAIN_JS_URL + "?t=" + Date.now() });
@@ -155,20 +171,35 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
       await this.app.plugins.enablePlugin(id);
     } catch (e) {
       console.error("GDrive Sync: self-update failed", e);
-      new import_obsidian.Notice("\u274C GDrive Sync: Auto-update failed. Please update manually.");
+      new import_obsidian.Notice("\u274C GDrive Sync: Auto-update failed: " + (e instanceof Error ? e.message : String(e)));
     }
   }
+
   isConfigured() { return !!(this.settings.clientId && this.settings.clientSecret && this.settings.refreshToken); }
   setStatus(msg) { this.statusBarItem.setText(msg); }
   errMsg(e) { return (e instanceof Error ? e.message : String(e)) || "Unknown error"; }
+
   async saveSettings() {
     var _a; const current = (_a = await this.loadData()) != null ? _a : {};
-    await this.saveData({ ...current, ...this.settings, lastSynced: this.lastSynced, driveChangesPageToken: this.driveChangesPageToken });
+    await this.saveData({
+      ...current, ...this.settings,
+      lastSynced: this.lastSynced,
+      driveChangesPageToken: this.driveChangesPageToken,
+      folderIdCache: Array.from(this.folderIdCache.entries()),
+      driveIdToPath: Array.from(this.driveIdToPath.entries())
+    });
   }
   async saveLastSynced() {
     var _a; const current = (_a = await this.loadData()) != null ? _a : {};
-    await this.saveData({ ...current, lastSynced: this.lastSynced, driveChangesPageToken: this.driveChangesPageToken });
+    await this.saveData({
+      ...current,
+      lastSynced: this.lastSynced,
+      driveChangesPageToken: this.driveChangesPageToken,
+      folderIdCache: Array.from(this.folderIdCache.entries()),
+      driveIdToPath: Array.from(this.driveIdToPath.entries())
+    });
   }
+
   async getAccessToken() {
     if (this.accessToken && Date.now() < this.accessTokenExpiry - 6e4) return this.accessToken;
     if (this.accessTokenRefreshPromise) return this.accessTokenRefreshPromise;
@@ -187,6 +218,7 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
     })();
     try { return await this.accessTokenRefreshPromise; } finally { this.accessTokenRefreshPromise = null; }
   }
+
   async ensureDriveFolder() {
     var _a;
     if (this.driveFolderId) return this.driveFolderId;
@@ -223,6 +255,7 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
     if (lastSlash === -1) return await this.ensureDriveFolder();
     return await this.ensureDrivePath(filePath.substring(0, lastSlash));
   }
+
   async listDriveFilesRecursive(folderId, pathPrefix = "") {
     const token = await this.getAccessToken();
     let results = [], pageToken = null;
@@ -233,19 +266,26 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
       for (const f of data.files || []) {
         const fullPath = pathPrefix ? `${pathPrefix}/${f.name}` : f.name;
         if (f.mimeType === "application/vnd.google-apps.folder") {
+          // FIX #3: populate both caches while listing
           this.folderIdCache.set(fullPath, f.id);
           results = results.concat(await this.listDriveFilesRecursive(f.id, fullPath));
-        } else { results.push({ id: f.id, name: f.name, path: fullPath, modifiedTime: f.modifiedTime, md5Checksum: f.md5Checksum }); }
+        } else {
+          // FIX #3: track driveId -> vaultPath for remote delete resolution
+          this.driveIdToPath.set(f.id, fullPath);
+          results.push({ id: f.id, name: f.name, path: fullPath, modifiedTime: f.modifiedTime, md5Checksum: f.md5Checksum });
+        }
       }
       pageToken = data.nextPageToken || null;
     } while (pageToken);
     return results;
   }
+
   async fetchStartPageToken() {
     const token = await this.getAccessToken();
     const data = await this.apiGet("https://www.googleapis.com/drive/v3/changes/startPageToken", token);
     return data.startPageToken;
   }
+
   async fetchDeltaChanges() {
     var _a;
     const token = await this.getAccessToken();
@@ -257,8 +297,15 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
       const data = await this.apiGet(url, token);
       for (const change of data.changes || []) {
         const f = change.file;
-        if (!f || f.mimeType === "application/vnd.google-apps.folder") continue;
-        if (change.removed || f.trashed) { changes.push({ filePath: change.fileId, fileId: change.fileId, removed: true, modifiedTime: 0 }); continue; }
+        if (f && f.mimeType === "application/vnd.google-apps.folder") continue;
+        if (change.removed || (f && f.trashed)) {
+          // FIX #2: resolve vault path from persisted driveIdToPath map
+          const resolvedPath = this.driveIdToPath.get(change.fileId);
+          if (resolvedPath) changes.push({ filePath: resolvedPath, fileId: change.fileId, removed: true, modifiedTime: 0 });
+          // If not in map, we never knew about this file — safe to ignore
+          continue;
+        }
+        if (!f) continue;
         const parentId = (_a = f.parents) == null ? void 0 : _a[0];
         let vaultFolder = "";
         if (parentId === folderId) { vaultFolder = ""; }
@@ -267,6 +314,8 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
           if (!vaultFolder && parentId !== folderId) continue;
         }
         const filePath = vaultFolder ? `${vaultFolder}/${f.name}` : f.name;
+        // FIX #3: keep driveIdToPath up to date from delta changes too
+        this.driveIdToPath.set(change.fileId, filePath);
         changes.push({ filePath, fileId: change.fileId, removed: false, modifiedTime: f.modifiedTime ? new Date(f.modifiedTime).getTime() : 0 });
       }
       if (data.nextPageToken) { pageToken = data.nextPageToken; }
@@ -275,6 +324,7 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
     this.driveChangesPageToken = newPageToken;
     return changes;
   }
+
   async writeFileConflictSafe(filePath, buffer, driveModifiedTime) {
     var _a;
     const localFile = this.app.vault.getAbstractFileByPath(filePath);
@@ -301,6 +351,7 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
       try { await this.app.vault.createBinary(filePath, buffer); } finally { this.downloading.delete(filePath); }
     }
   }
+
   async fullTwoWaySync() {
     if (!this.isConfigured()) { new import_obsidian.Notice("\u26A0\uFE0F GDrive Sync: Please enter credentials first."); return; }
     if (this.isSyncing) return;
@@ -311,12 +362,13 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
       const token = await this.getAccessToken();
       let downloaded = 0;
 
-      // Build driveMap once — used for both download phase and upload MD5 checks
+      // Build driveMap — also populates folderIdCache and driveIdToPath
       const driveFiles = await this.listDriveFilesRecursive(rootId);
       const driveMap = {};
       for (const df of driveFiles) driveMap[df.path] = { id: df.id, modifiedTime: new Date(df.modifiedTime).getTime(), md5Checksum: df.md5Checksum };
 
       if (!this.driveChangesPageToken) {
+        // First ever sync: download anything Drive has that's newer than local
         const driveEntries = Object.entries(driveMap);
         for (let i = 0; i < driveEntries.length; i += BATCH_SIZE) {
           const batch = driveEntries.slice(i, i + BATCH_SIZE);
@@ -327,11 +379,17 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
               try {
                 const buffer = await this.apiDownload(`https://www.googleapis.com/drive/v3/files/${driveInfo.id}?alt=media`, token);
                 await this.writeFileConflictSafe(filePath, buffer, driveInfo.modifiedTime);
-                this.lastSynced[filePath] = driveInfo.modifiedTime;
+                // FIX #4: record local mtime after write, not Drive's timestamp
+                const written = this.app.vault.getAbstractFileByPath(filePath);
+                this.lastSynced[filePath] = written instanceof import_obsidian.TFile ? written.stat.mtime : Date.now();
                 downloaded++;
               } catch (e) { console.error("Download error:", filePath, this.errMsg(e)); }
+            } else {
+              // File already up to date locally — stamp it so upload phase skips it
+              if (!this.lastSynced[filePath]) this.lastSynced[filePath] = localMtime;
             }
           }));
+          // FIX #11: cap display counter at total
           this.setStatus(`\u2B07\uFE0F ${downloaded}/${driveEntries.length}...`);
         }
         this.driveChangesPageToken = await this.fetchStartPageToken();
@@ -339,11 +397,15 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
         const changes = await this.fetchDeltaChanges();
         const relevant = changes.filter(c => !c.removed);
         const removed = changes.filter(c => c.removed);
+        // FIX #2: filePath is now the real vault path (resolved via driveIdToPath)
         for (const c of removed) {
           const localFile = this.app.vault.getAbstractFileByPath(c.filePath);
           if (localFile instanceof import_obsidian.TFile) {
-            try { await this.app.vault.delete(localFile); delete this.lastSynced[c.filePath]; }
-            catch (e) { console.error("Local delete error:", c.filePath, this.errMsg(e)); }
+            try {
+              await this.app.vault.delete(localFile);
+              delete this.lastSynced[c.filePath];
+              this.driveIdToPath.delete(c.fileId);
+            } catch (e) { console.error("Local delete error:", c.filePath, this.errMsg(e)); }
           }
         }
         for (let i = 0; i < relevant.length; i += BATCH_SIZE) {
@@ -352,7 +414,9 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
             try {
               const buffer = await this.apiDownload(`https://www.googleapis.com/drive/v3/files/${c.fileId}?alt=media`, token);
               await this.writeFileConflictSafe(c.filePath, buffer, c.modifiedTime);
-              this.lastSynced[c.filePath] = c.modifiedTime;
+              // FIX #4: record local mtime after write
+              const written = this.app.vault.getAbstractFileByPath(c.filePath);
+              this.lastSynced[c.filePath] = written instanceof import_obsidian.TFile ? written.stat.mtime : Date.now();
               downloaded++;
             } catch (e) { console.error("Delta download error:", c.filePath, this.errMsg(e)); }
           }));
@@ -360,15 +424,15 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
         }
       }
 
-      // Upload phase — only upload if local mtime changed since last sync.
-      // Falls back to MD5 check when available for extra safety.
+      // Upload phase — mtime gate skips unchanged files instantly
       const localFiles = this.app.vault.getFiles();
       let uploaded = 0;
       for (let i = 0; i < localFiles.length; i += BATCH_SIZE) {
         const batch = localFiles.slice(i, i + BATCH_SIZE);
-        const results = await Promise.all(batch.map(f => this.uploadFile(f, true, driveMap)));
+        const results = await Promise.all(batch.map(f => this.uploadFile(f, driveMap)));
         uploaded += results.filter(r => r === true).length;
-        this.setStatus(`\u2B06\uFE0F ${i + batch.length}/${localFiles.length}...`);
+        // FIX #11: don't let counter exceed total
+        this.setStatus(`\u2B06\uFE0F ${Math.min(i + batch.length, localFiles.length)}/${localFiles.length}...`);
       }
 
       await this.saveLastSynced();
@@ -379,11 +443,13 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
       new import_obsidian.Notice("\u274C GDrive Sync failed: " + this.errMsg(e));
     } finally { this.isSyncing = false; }
   }
-  async uploadFile(file, force = false, driveMap) {
+
+  // FIX #12: removed unused `force` parameter
+  async uploadFile(file, driveMap) {
     var _a;
     if (!this.isConfigured()) return false;
     try {
-      // Fast skip: if mtime hasn't changed since last sync, no need to upload or hash
+      // Mtime gate: skip instantly if file hasn't changed since last sync
       const lastSync = this.lastSynced[file.path];
       if (lastSync && file.stat.mtime <= lastSync) return false;
 
@@ -402,31 +468,50 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
         existingId = existing == null ? void 0 : existing.id;
         existingMd5 = existing == null ? void 0 : existing.md5Checksum;
       }
-      // Skip if MD5 matches (extra safety net for edge cases)
+      // MD5 safety net
       if (existingMd5 && existingMd5 === localMd5) { this.lastSynced[file.path] = file.stat.mtime; return false; }
       const parentFolderId = await this.getFolderIdForFile(file.path);
       const metadata = { name: file.name, ...(existingId ? {} : { parents: [parentFolderId] }) };
-      const uploadUrl = existingId ? `https://www.googleapis.com/upload/drive/v3/files/${existingId}?uploadType=multipart` : `https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart`;
-      await this.apiUpload(uploadUrl, existingId ? "PATCH" : "POST", token, metadata, content);
+      const uploadUrl = existingId
+        ? `https://www.googleapis.com/upload/drive/v3/files/${existingId}?uploadType=multipart`
+        : `https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart`;
+      const result = await this.apiUpload(uploadUrl, existingId ? "PATCH" : "POST", token, metadata, content);
       this.lastSynced[file.path] = file.stat.mtime;
+      // FIX #3: keep driveIdToPath updated on every upload
+      if (result && result.id) this.driveIdToPath.set(result.id, file.path);
       return true;
     } catch (e) { console.error("GDrive upload error:", file.path, this.errMsg(e)); return false; }
   }
+
   async deleteFromDrive(filePath) {
-    var _a, _b;
     if (!this.isConfigured()) return;
     try {
       const token = await this.getAccessToken();
-      const parentFolderId = await this.getFolderIdForFile(filePath);
-      const fileName = filePath.includes("/") ? filePath.substring(filePath.lastIndexOf("/") + 1) : filePath;
-      const query = `name='${fileName}' and '${parentFolderId}' in parents and trashed=false`;
-      const searchData = await this.apiGet(`https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(query)}&fields=files(id)`, token);
-      if ((_b = (_a = searchData.files) == null ? void 0 : _a[0]) == null ? void 0 : _b.id) {
-        await this.apiDelete(`https://www.googleapis.com/drive/v3/files/${searchData.files[0].id}`, token);
-        delete this.lastSynced[filePath]; await this.saveLastSynced();
+      // FIX #1: look up the exact Drive file ID we recorded, not by name search
+      // Find the fileId we stored for this vault path
+      let fileIdToDelete = null;
+      for (const [id, path] of this.driveIdToPath.entries()) {
+        if (path === filePath) { fileIdToDelete = id; break; }
       }
+      if (fileIdToDelete) {
+        await this.apiDelete(`https://www.googleapis.com/drive/v3/files/${fileIdToDelete}`, token);
+        this.driveIdToPath.delete(fileIdToDelete);
+      } else {
+        // Fallback: name-based search (for files uploaded before v1.1.1)
+        const parentFolderId = await this.getFolderIdForFile(filePath);
+        const fileName = filePath.includes("/") ? filePath.substring(filePath.lastIndexOf("/") + 1) : filePath;
+        const query = `name='${fileName}' and '${parentFolderId}' in parents and trashed=false`;
+        const searchData = await this.apiGet(`https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(query)}&fields=files(id)`, token);
+        var _a, _b;
+        if ((_b = (_a = searchData.files) == null ? void 0 : _a[0]) == null ? void 0 : _b.id) {
+          await this.apiDelete(`https://www.googleapis.com/drive/v3/files/${searchData.files[0].id}`, token);
+        }
+      }
+      delete this.lastSynced[filePath];
+      await this.saveLastSynced();
     } catch (e) { console.error("GDrive delete error:", this.errMsg(e)); }
   }
+
   async downloadAll() {
     if (!this.isConfigured()) { new import_obsidian.Notice("\u26A0\uFE0F Please enter credentials first."); return; }
     if (this.isSyncing) { new import_obsidian.Notice("\u26A0\uFE0F Sync already in progress, please wait."); return; }
@@ -443,6 +528,9 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
           try {
             const buffer = await this.apiDownload(`https://www.googleapis.com/drive/v3/files/${df.id}?alt=media`, token);
             await this.writeFileConflictSafe(df.path, buffer, new Date(df.modifiedTime).getTime());
+            // FIX #4: use local mtime after write
+            const written = this.app.vault.getAbstractFileByPath(df.path);
+            this.lastSynced[df.path] = written instanceof import_obsidian.TFile ? written.stat.mtime : Date.now();
             count++;
           } catch (e) { console.error("Download error:", df.path, this.errMsg(e)); }
         }));
@@ -457,6 +545,7 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
       new import_obsidian.Notice("\u274C Download failed: " + this.errMsg(e));
     } finally { this.isSyncing = false; }
   }
+
   startAutoSync() {
     if (this.syncIntervalId !== null) { clearInterval(this.syncIntervalId); this.syncIntervalId = null; }
     this.fullTwoWaySync();

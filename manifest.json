@@ -1,7 +1,7 @@
 {
   "id": "gdrive-vault-sync",
   "name": "Google Drive Vault Sync",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "minAppVersion": "1.4.0",
   "description": "Automatically syncs your entire vault to Google Drive using OAuth. Two-way sync on open, watches file changes, delta sync via Drive Changes API, conflict resolution. Works on all devices.",
   "author": "JanakaProjects",
