@@ -70,7 +70,6 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
     this.accessTokenExpiry = 0;
     this.accessTokenRefreshPromise = null;
     this.driveFolderId = "";
-    // Cache: folderPath (relative to vault root in Drive) -> Drive folder ID
     this.folderIdCache = /* @__PURE__ */ new Map();
     this.syncIntervalId = null;
     this.isSyncing = false;
@@ -117,6 +116,11 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
       clearInterval(this.syncIntervalId);
       this.syncIntervalId = null;
     }
+  }
+  // ── MD5 hash of local file content (DriveSync-style) ─────────────────
+  async hashBuffer(buffer) {
+    const crypto = require("crypto");
+    return crypto.createHash("md5").update(Buffer.from(buffer)).digest("hex");
   }
   // ── HTTP helpers ──────────────────────────────────────────────────────
   async apiGet(url, token) {
@@ -295,8 +299,6 @@ Content-Type: application/octet-stream\r
     this.driveFolderId = folder.id;
     return this.driveFolderId;
   }
-  // ── Ensure nested subfolder path, returns leaf folder ID ─────────────
-  // vaultFolderPath: e.g. "Notes/Work" relative to vault root
   async ensureDrivePath(vaultFolderPath) {
     var _a;
     const rootId = await this.ensureDriveFolder();
@@ -332,7 +334,6 @@ Content-Type: application/octet-stream\r
     }
     return parentId;
   }
-  // ── Get folder ID for a vault file path ──────────────────────────────
   async getFolderIdForFile(filePath) {
     const lastSlash = filePath.lastIndexOf("/");
     if (lastSlash === -1)
@@ -346,7 +347,7 @@ Content-Type: application/octet-stream\r
     let results = [];
     let pageToken = null;
     do {
-      let url = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(`'${folderId}' in parents and trashed=false`)}&fields=nextPageToken,files(id,name,mimeType,modifiedTime)`;
+      let url = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(`'${folderId}' in parents and trashed=false`)}&fields=nextPageToken,files(id,name,mimeType,modifiedTime,md5Checksum)`;
       if (pageToken)
         url += `&pageToken=${encodeURIComponent(pageToken)}`;
       const data = await this.apiGet(url, token);
@@ -357,7 +358,7 @@ Content-Type: application/octet-stream\r
           const children = await this.listDriveFilesRecursive(f.id, fullPath);
           results = results.concat(children);
         } else {
-          results.push({ id: f.id, name: f.name, path: fullPath, modifiedTime: f.modifiedTime });
+          results.push({ id: f.id, name: f.name, path: fullPath, modifiedTime: f.modifiedTime, md5Checksum: f.md5Checksum });
         }
       }
       pageToken = data.nextPageToken || null;
@@ -474,7 +475,7 @@ Drive version saved as "${conflictPath}"`);
       }
     }
   }
-  // ── Two-way sync (delta-aware) ────────────────────────────────────────
+  // ── Two-way sync (delta-aware + MD5 skip) ────────────────────────────
   async fullTwoWaySync() {
     if (!this.isConfigured()) {
       new import_obsidian.Notice("\u26A0\uFE0F GDrive Sync: Please enter credentials first.");
@@ -492,7 +493,7 @@ Drive version saved as "${conflictPath}"`);
         const driveFiles = await this.listDriveFilesRecursive(rootId);
         const driveMap = {};
         for (const df of driveFiles) {
-          driveMap[df.path] = { id: df.id, modifiedTime: new Date(df.modifiedTime).getTime() };
+          driveMap[df.path] = { id: df.id, modifiedTime: new Date(df.modifiedTime).getTime(), md5Checksum: df.md5Checksum };
         }
         const driveEntries = Object.entries(driveMap);
         for (let i = 0; i < driveEntries.length; i += BATCH_SIZE) {
@@ -551,17 +552,12 @@ Drive version saved as "${conflictPath}"`);
         }
       }
       const localFiles = this.app.vault.getFiles();
-      const toUpload = localFiles.filter((f) => {
-        var _a;
-        const lastSync = (_a = this.lastSynced[f.path]) != null ? _a : 0;
-        return f.stat.mtime > lastSync;
-      });
       let uploaded = 0;
-      for (let i = 0; i < toUpload.length; i += BATCH_SIZE) {
-        const batch = toUpload.slice(i, i + BATCH_SIZE);
+      for (let i = 0; i < localFiles.length; i += BATCH_SIZE) {
+        const batch = localFiles.slice(i, i + BATCH_SIZE);
         const results = await Promise.all(batch.map((f) => this.uploadFile(f, true)));
-        uploaded += results.filter(Boolean).length;
-        this.setStatus(`\u2B06\uFE0F ${uploaded}/${toUpload.length}...`);
+        uploaded += results.filter((r) => r === true).length;
+        this.setStatus(`\u2B06\uFE0F ${uploaded}/${localFiles.length}...`);
       }
       await this.saveLastSynced();
       this.setStatus(`\u2705 \u2B07${downloaded} \u2B06${uploaded} \u2014 ${new Date().toLocaleTimeString()}`);
@@ -575,24 +571,28 @@ Drive version saved as "${conflictPath}"`);
       this.isSyncing = false;
     }
   }
-  // ── Upload single file ────────────────────────────────────────────────
+  // ── Upload single file — MD5 checksum first, skip if identical ────────
   async uploadFile(file, force = false) {
-    var _a, _b;
+    var _a;
     if (!this.isConfigured())
-      return false;
-    if (!force && this.lastSynced[file.path] && this.lastSynced[file.path] >= file.stat.mtime)
       return false;
     try {
       const token = await this.getAccessToken();
       const parentFolderId = await this.getFolderIdForFile(file.path);
       const content = await this.app.vault.readBinary(file);
+      const localMd5 = await this.hashBuffer(content);
       const fileName = file.name;
       const query = `name='${fileName}' and '${parentFolderId}' in parents and trashed=false and mimeType!='application/vnd.google-apps.folder'`;
       const searchData = await this.apiGet(
-        `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(query)}&fields=files(id)`,
+        `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(query)}&fields=files(id,md5Checksum,modifiedTime)`,
         token
       );
-      const existingId = (_b = (_a = searchData.files) == null ? void 0 : _a[0]) == null ? void 0 : _b.id;
+      const existing = (_a = searchData.files) == null ? void 0 : _a[0];
+      if ((existing == null ? void 0 : existing.md5Checksum) && existing.md5Checksum === localMd5) {
+        this.lastSynced[file.path] = file.stat.mtime;
+        return false;
+      }
+      const existingId = existing == null ? void 0 : existing.id;
       const metadata = { name: fileName, ...existingId ? {} : { parents: [parentFolderId] } };
       const uploadUrl = existingId ? `https://www.googleapis.com/upload/drive/v3/files/${existingId}?uploadType=multipart` : `https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart`;
       await this.apiUpload(uploadUrl, existingId ? "PATCH" : "POST", token, metadata, content);
