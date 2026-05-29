@@ -64,7 +64,6 @@ export default class GDriveSyncPlugin extends Plugin {
   accessTokenExpiry: number = 0;
   accessTokenRefreshPromise: Promise<string> | null = null;
   driveFolderId: string = "";
-  // Cache: folderPath (relative to vault root in Drive) -> Drive folder ID
   private folderIdCache: Map<string, string> = new Map();
   syncIntervalId: number | null = null;
   statusBarItem: HTMLElement;
@@ -111,6 +110,12 @@ export default class GDriveSyncPlugin extends Plugin {
       clearInterval(this.syncIntervalId);
       this.syncIntervalId = null;
     }
+  }
+
+  // ── MD5 hash of local file content (DriveSync-style) ─────────────────
+  async hashBuffer(buffer: ArrayBuffer): Promise<string> {
+    const crypto = require("crypto");
+    return crypto.createHash("md5").update(Buffer.from(buffer)).digest("hex");
   }
 
   // ── HTTP helpers ──────────────────────────────────────────────────────
@@ -276,21 +281,16 @@ export default class GDriveSyncPlugin extends Plugin {
     return this.driveFolderId;
   }
 
-  // ── Ensure nested subfolder path, returns leaf folder ID ─────────────
-  // vaultFolderPath: e.g. "Notes/Work" relative to vault root
   async ensureDrivePath(vaultFolderPath: string): Promise<string> {
     const rootId = await this.ensureDriveFolder();
     if (!vaultFolderPath || vaultFolderPath === "/") return rootId;
-
     const parts = vaultFolderPath.split("/").filter(p => p.length > 0);
     let parentId = rootId;
     let cumulativePath = "";
-
     for (const part of parts) {
       cumulativePath = cumulativePath ? `${cumulativePath}/${part}` : part;
       const cached = this.folderIdCache.get(cumulativePath);
       if (cached) { parentId = cached; continue; }
-
       const token = await this.getAccessToken();
       const query = `name='${part}' and mimeType='application/vnd.google-apps.folder' and trashed=false and '${parentId}' in parents`;
       const searchData = await this.apiGet(
@@ -311,10 +311,9 @@ export default class GDriveSyncPlugin extends Plugin {
     return parentId;
   }
 
-  // ── Get folder ID for a vault file path ──────────────────────────────
   async getFolderIdForFile(filePath: string): Promise<string> {
     const lastSlash = filePath.lastIndexOf("/");
-    if (lastSlash === -1) return await this.ensureDriveFolder(); // root
+    if (lastSlash === -1) return await this.ensureDriveFolder();
     const folderPath = filePath.substring(0, lastSlash);
     return await this.ensureDrivePath(folderPath);
   }
@@ -323,15 +322,15 @@ export default class GDriveSyncPlugin extends Plugin {
   async listDriveFilesRecursive(
     folderId: string,
     pathPrefix: string = ""
-  ): Promise<{ id: string; name: string; path: string; modifiedTime: string }[]> {
+  ): Promise<{ id: string; name: string; path: string; modifiedTime: string; md5Checksum?: string }[]> {
     const token = await this.getAccessToken();
-    let results: { id: string; name: string; path: string; modifiedTime: string }[] = [];
+    let results: { id: string; name: string; path: string; modifiedTime: string; md5Checksum?: string }[] = [];
     let pageToken: string | null = null;
 
     do {
       let url = `https://www.googleapis.com/drive/v3/files`
         + `?q=${encodeURIComponent(`'${folderId}' in parents and trashed=false`)}`
-        + `&fields=nextPageToken,files(id,name,mimeType,modifiedTime)`;
+        + `&fields=nextPageToken,files(id,name,mimeType,modifiedTime,md5Checksum)`;
       if (pageToken) url += `&pageToken=${encodeURIComponent(pageToken)}`;
       const data = await this.apiGet(url, token);
 
@@ -342,7 +341,7 @@ export default class GDriveSyncPlugin extends Plugin {
           const children = await this.listDriveFilesRecursive(f.id, fullPath);
           results = results.concat(children);
         } else {
-          results.push({ id: f.id, name: f.name, path: fullPath, modifiedTime: f.modifiedTime });
+          results.push({ id: f.id, name: f.name, path: fullPath, modifiedTime: f.modifiedTime, md5Checksum: f.md5Checksum });
         }
       }
       pageToken = data.nextPageToken || null;
@@ -375,28 +374,20 @@ export default class GDriveSyncPlugin extends Plugin {
       for (const change of (data.changes || [])) {
         const f = change.file;
         if (!f) continue;
-        // Skip folders themselves — we only care about file changes
         if (f.mimeType === "application/vnd.google-apps.folder") continue;
-
-        // Resolve the full vault path by walking parent IDs
-        // For delta changes we do a best-effort path resolution using cache
-        // If not cached, skip — full sync will catch it
         if (change.removed || f.trashed) {
           changes.push({ filePath: change.fileId, fileId: change.fileId, removed: true, modifiedTime: 0 });
           continue;
         }
-
-        // Try to find the vault path from folder cache
         const parentId = f.parents?.[0];
         let vaultFolder = "";
         if (parentId === folderId) {
           vaultFolder = "";
         } else {
-          // Find from cache
           for (const [path, id] of this.folderIdCache.entries()) {
             if (id === parentId) { vaultFolder = path; break; }
           }
-          if (!vaultFolder && parentId !== folderId) continue; // can't resolve, skip
+          if (!vaultFolder && parentId !== folderId) continue;
         }
         const filePath = vaultFolder ? `${vaultFolder}/${f.name}` : f.name;
         changes.push({
@@ -423,7 +414,6 @@ export default class GDriveSyncPlugin extends Plugin {
   async writeFileConflictSafe(filePath: string, buffer: ArrayBuffer, driveModifiedTime: number): Promise<void> {
     const localFile = this.app.vault.getAbstractFileByPath(filePath);
     const lastSync = this.lastSynced[filePath] ?? 0;
-
     const dir = filePath.includes("/") ? filePath.substring(0, filePath.lastIndexOf("/")) : null;
     if (dir) { try { await this.app.vault.createFolder(dir); } catch {} }
 
@@ -455,7 +445,7 @@ export default class GDriveSyncPlugin extends Plugin {
     }
   }
 
-  // ── Two-way sync (delta-aware) ────────────────────────────────────────
+  // ── Two-way sync (delta-aware + MD5 skip) ────────────────────────────
   async fullTwoWaySync() {
     if (!this.isConfigured()) { new Notice("⚠️ GDrive Sync: Please enter credentials first."); return; }
     if (this.isSyncing) return;
@@ -467,11 +457,10 @@ export default class GDriveSyncPlugin extends Plugin {
       let downloaded = 0;
 
       if (!this.driveChangesPageToken) {
-        // Full listing — walk real folder tree
         const driveFiles = await this.listDriveFilesRecursive(rootId);
-        const driveMap: Record<string, { id: string; modifiedTime: number }> = {};
+        const driveMap: Record<string, { id: string; modifiedTime: number; md5Checksum?: string }> = {};
         for (const df of driveFiles) {
-          driveMap[df.path] = { id: df.id, modifiedTime: new Date(df.modifiedTime).getTime() };
+          driveMap[df.path] = { id: df.id, modifiedTime: new Date(df.modifiedTime).getTime(), md5Checksum: df.md5Checksum };
         }
         const driveEntries = Object.entries(driveMap);
         for (let i = 0; i < driveEntries.length; i += BATCH_SIZE) {
@@ -520,17 +509,14 @@ export default class GDriveSyncPlugin extends Plugin {
         }
       }
 
+      // Upload phase — MD5-first skip (DriveSync-style: never re-upload identical files)
       const localFiles = this.app.vault.getFiles();
-      const toUpload = localFiles.filter(f => {
-        const lastSync = this.lastSynced[f.path] ?? 0;
-        return f.stat.mtime > lastSync;
-      });
       let uploaded = 0;
-      for (let i = 0; i < toUpload.length; i += BATCH_SIZE) {
-        const batch = toUpload.slice(i, i + BATCH_SIZE);
+      for (let i = 0; i < localFiles.length; i += BATCH_SIZE) {
+        const batch = localFiles.slice(i, i + BATCH_SIZE);
         const results = await Promise.all(batch.map(f => this.uploadFile(f, true)));
-        uploaded += results.filter(Boolean).length;
-        this.setStatus(`⬆️ ${uploaded}/${toUpload.length}...`);
+        uploaded += results.filter(r => r === true).length;
+        this.setStatus(`⬆️ ${uploaded}/${localFiles.length}...`);
       }
 
       await this.saveLastSynced();
@@ -546,22 +532,30 @@ export default class GDriveSyncPlugin extends Plugin {
     }
   }
 
-  // ── Upload single file ────────────────────────────────────────────────
+  // ── Upload single file — MD5 checksum first, skip if identical ────────
   async uploadFile(file: TFile, force = false): Promise<boolean> {
     if (!this.isConfigured()) return false;
-    if (!force && this.lastSynced[file.path] && this.lastSynced[file.path] >= file.stat.mtime) return false;
     try {
       const token = await this.getAccessToken();
       const parentFolderId = await this.getFolderIdForFile(file.path);
       const content = await this.app.vault.readBinary(file);
-      const fileName = file.name; // just the filename, no path
+      const localMd5 = await this.hashBuffer(content);
+      const fileName = file.name;
 
-      // Search for existing file in the correct subfolder
+      // Ask Drive for existing file including md5Checksum
       const query = `name='${fileName}' and '${parentFolderId}' in parents and trashed=false and mimeType!='application/vnd.google-apps.folder'`;
       const searchData = await this.apiGet(
-        `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(query)}&fields=files(id)`, token
+        `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(query)}&fields=files(id,md5Checksum,modifiedTime)`, token
       );
-      const existingId = searchData.files?.[0]?.id;
+      const existing = searchData.files?.[0];
+
+      // ✅ DriveSync-style: content identical → skip upload entirely
+      if (existing?.md5Checksum && existing.md5Checksum === localMd5) {
+        this.lastSynced[file.path] = file.stat.mtime;
+        return false;
+      }
+
+      const existingId = existing?.id;
       const metadata = { name: fileName, ...(existingId ? {} : { parents: [parentFolderId] }) };
       const uploadUrl = existingId
         ? `https://www.googleapis.com/upload/drive/v3/files/${existingId}?uploadType=multipart`
